@@ -1,0 +1,72 @@
+# faceswap_pro v2 — Python deps
+#
+# Install order:
+#   1. pip install -r requirements.txt
+#   2. pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 \
+#        --index-url https://download.pytorch.org/whl/cu121
+#   (torch is intentionally NOT pinned here so step 2 picks the CUDA
+#    build for your machine. See INSTALL.md.)
+#
+# Subprocess-launched upstream repos (LatentSync, RVC) install
+# their own deps when first invoked; we deliberately do not bring them
+# into this file because the version pins conflict with each other.
+#
+# Pin philosophy: lower-bounds (>=) for the minimum API surface
+# the code uses; upper-bounds (<X) only when a known-broken
+# release exists. Hard pins (==) are last-resort. Loose pins let
+# new clones resolve cleanly against current wheels.
+
+# ---- core UI + framework ----
+gradio>=4.40.0,<6
+fastapi>=0.110
+uvicorn[standard]>=0.27
+
+# ---- model runtime ----
+onnxruntime-gpu>=1.18
+diffusers>=0.32.2
+transformers>=4.40
+accelerate>=0.30
+omegaconf==2.3.0
+antlr4-python3-runtime==4.9.3
+einops>=0.7
+huggingface-hub>=0.23
+safetensors>=0.4
+
+# ---- vision / audio ----
+opencv-python>=4.9
+opencv-contrib-python>=4.9
+imageio>=2.34
+imageio-ffmpeg>=0.5
+Pillow>=10.0
+numpy>=1.24
+scipy>=1.11
+soundfile>=0.12
+librosa>=0.10
+decord>=0.6
+albumentations>=1.4,<2
+
+# ---- face stack ----
+insightface>=0.7.3
+gfpgan>=1.3.8
+basicsr>=1.4.2
+# realesrgan is OPTIONAL. GFPGAN's default 'Enhance faces' knob
+# works without it. Install manually only if you need the
+# realesrgan background restorer:  pip install realesrgan
+facexlib>=0.3
+
+# ---- mask / SAM ----
+# NOTE: install SAM 2 from source (see INSTALL.md). The PyPI package
+# is incomplete. If you want the worker's "v2 path" you need:
+#   pip install -e <sam2-clone>
+# This module is otherwise lazy-imported and won't break the rest of
+# the app if absent.
+hydra-core>=1.3
+
+# ---- audio source-separation ----
+demucs>=4.0
+
+# ---- nicety ----
+tqdm>=4.66
+psutil>=5.9
+rich>=13.7
+PyYAML>=6.0

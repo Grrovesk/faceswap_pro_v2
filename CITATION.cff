@@ -1,0 +1,54 @@
+cff-version: 1.2.0
+title: faceswap_pro v2
+message: >-
+  If you use this software in academic work, please cite it using
+  the metadata below.
+type: software
+authors:
+  - name: faceswap_pro contributors
+    website: "https://github.com/seedhunterai/faceswap_pro_v2"
+repository-code: "https://github.com/seedhunterai/faceswap_pro_v2"
+abstract: >-
+  A desktop Gradio app for AI face-swap and lip-sync on video.
+  Integrates LatentSync 1.6 (lip-sync), InsightFace inswapper_128
+  (face-swap), GFPGAN (face restoration), Demucs (vocal isolation),
+  SAM 2 (mask propagation), and per-clip identity fine-tuning.
+keywords:
+  - lip-sync
+  - face-swap
+  - deepfake-detection
+  - generative-ai
+  - latent-diffusion
+  - audio-driven-animation
+license: Apache-2.0
+version: "2.0.0"
+date-released: "2026-06-06"
+references:
+  - type: article
+    title: >-
+      LatentSync: Taming Audio-Conditioned Latent Diffusion Models
+      for Lip Sync with SyncNet Supervision
+    authors:
+      - family-names: Li
+        given-names: Chunyu
+    year: 2024
+    journal: arXiv preprint
+    notes: arXiv:2412.09262
+  - type: article
+    title: SAM 2 - Segment Anything in Images and Videos
+    authors:
+      - family-names: Ravi
+        given-names: Nikhila
+    year: 2024
+    journal: arXiv preprint
+    notes: arXiv:2408.00714
+  - type: conference-paper
+    title: >-
+      ArcFace - Additive Angular Margin Loss for Deep Face
+      Recognition
+    authors:
+      - family-names: Deng
+        given-names: Jiankang
+    year: 2019
+    conference:
+      name: CVPR

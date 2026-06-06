@@ -1,0 +1,55 @@
+# ---- model weights & per-clip workspaces (downloaded at runtime) ----
+checkpoints/
+models/
+voice_models/
+gfpgan/
+# LatentSync upstream repo (not shipped; user clones per INSTALL.md)
+# Both forms are listed because git treats a dir with its own .git/
+# as a gitlink (no trailing slash) instead of a tracked directory.
+lipsync_test/LatentSync
+lipsync_test/LatentSync/
+
+# ---- working dirs / scratch ----
+lipsync_test/_extend_single_work/
+lipsync_test/_multiclip_work/
+lipsync_test/_ls_scratch_v2/
+lipsync_test/inputs/
+lipsync_test/output/
+lipsync_test/stems/
+lipsync_test/models/
+_snapshots/
+_snapshots_v2/
+
+# ---- KeySync clone (optional, never ships) ----
+lipsync_test/KeySync/
+
+# ---- user-produced content ----
+recordings/
+
+# ---- per-host system detection (run detect_system.py to regenerate) ----
+PROJECT_ENV.md
+PROJECT_ENV.json
+
+# ---- python build artifacts ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+build/
+dist/
+
+# ---- Gradio runtime caches ----
+.gradio/
+gradio_cached_examples/
+
+# ---- editor / OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- venv (if user creates one inside the repo) ----
+.venv/
+venv/
+venv_*/
