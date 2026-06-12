@@ -18,7 +18,7 @@ from typing import Optional
 import gradio as gr
 
 from . import history, job_queue, orchestrator, presets, previews, video_swap
-from .config import (LatentSyncKnobs, LipsyncJob,
+from .config import (KeySyncKnobs, LatentSyncKnobs, LipsyncJob,
                        MaskOutConfig,
                        VideoSwapJob, VoiceSwap, WatermarkConfig,
                        AspectRatioConfig, OcclusionConfig)
@@ -38,16 +38,20 @@ _RENDER_CANCEL = _th.Event()
 # render handler
 # ============================================================
 def _run_render(face, audio, face_extras,
+                 engine_choice,
                  isolate, quick, enhance, extend_single,
-                 ls_steps, ls_guidance, ls_deepcache, ls_seed,
+                 ls_steps, ls_guidance, ls_deepcache, ls_seed, ls_color_match,
                  ls_face_det,
                  voice_model, voice_transpose,
                  wm_enabled, wm_image, wm_position, wm_scale, wm_opacity,
                  ar_enabled, ar_target, ar_fill,
                  occ_enabled, occ_bbox_smooth, occ_mask_smooth,
                  occ_align, occ_feather, occ_mouth_polygon,
+                 ks_face_click_x, ks_face_click_y, ks_face_click_frame,
+                 ks_skip_crop,
                  mout_enabled_v, mout_clicks_v,
-                 mout_dilate_v, mout_feather_v):
+                 mout_dilate_v, mout_feather_v,
+                 mout_npy_override_v):
     """Generator. Yields (video_path, status_md, history_update) every
     ~1.5s while the render is running so the UI shows live progress
     instead of a silent spinner. Final yield carries the result."""
@@ -65,6 +69,7 @@ def _run_render(face, audio, face_extras,
 
     job = LipsyncJob(
         face_paths=face_paths, audio_path=Path(audio),
+        engine=str(engine_choice or "latentsync").lower(),
         isolate_vocals=bool(isolate), enhance_faces=bool(enhance),
         quick_test=bool(quick), extend_single=bool(extend_single),
         latentsync=LatentSyncKnobs(
@@ -73,12 +78,20 @@ def _run_render(face, audio, face_extras,
             enable_deepcache=bool(ls_deepcache),
             seed=int(ls_seed),
             face_det_threshold=float(ls_face_det),
+            color_match_mode=str(ls_color_match or "reinhard"),
+        ),
+        keysync=KeySyncKnobs(
+            face_click_x=int(ks_face_click_x or 0),
+            face_click_y=int(ks_face_click_y or 0),
+            face_click_frame=int(ks_face_click_frame or 0),
+            skip_crop=bool(ks_skip_crop),
         ),
         maskout=MaskOutConfig(
             enabled=bool(mout_enabled_v),
             clicks=list(mout_clicks_v or []),
             dilate_px=int(mout_dilate_v),
             feather=int(mout_feather_v),
+            mask_npy_path=str(mout_npy_override_v or ""),
         ),
         voice_swap=VoiceSwap(
             model_basename=("" if (not voice_model or
@@ -243,7 +256,7 @@ def _format_eta(face, audio, face_extras, extend_single, enhance, quick):
 # preset handlers
 # ============================================================
 def _on_save_preset(name, isolate, quick, enhance, extend_single,
-                     ls_steps, ls_guidance, ls_deepcache, ls_seed,
+                     ls_steps, ls_guidance, ls_deepcache, ls_seed, ls_color_match,
                  ls_face_det,
                      voice_model, voice_transpose):
     if not name or not name.strip():
@@ -251,7 +264,7 @@ def _on_save_preset(name, isolate, quick, enhance, extend_single,
                 gr.update(choices=presets.list_presets()))
     out = presets.save_preset(
         name, isolate, quick, enhance, extend_single,
-        ls_steps, ls_guidance, ls_deepcache, ls_seed,
+        ls_steps, ls_guidance, ls_deepcache, ls_seed, ls_color_match,
         voice_model, voice_transpose)
     return (f"saved preset `{Path(out).stem}`",
             gr.update(choices=presets.list_presets(),
@@ -347,7 +360,13 @@ def _run_video_swap(source_img, target_vid,
                      mask_padding, mask_blur,
                      swap_strength, enhancer_blend,
                      selector_mode, reference_face_img,
-                     reference_distance, pixel_boost):
+                     reference_distance, pixel_boost,
+                     temporal_enabled, temporal_ema_decay,
+                     temporal_buffer_size,
+                     color_transfer_mode, shadow_correction,
+                     shadow_clamp_min, shadow_clamp_max,
+                     face_restorer="gfpgan",
+                     mask_npy_path=""):
     """Generator. Yields live progress while video_swap.run() executes
     in a daemon thread."""
     if not source_img:
@@ -399,6 +418,15 @@ def _run_video_swap(source_img, target_vid,
         reference_face_image=(Path(ref_path) if ref_path else None),
         reference_distance=float(reference_distance),
         pixel_boost=int(pixel_boost),
+        temporal_enabled=bool(temporal_enabled),
+        temporal_ema_decay=float(temporal_ema_decay),
+        temporal_buffer_size=int(temporal_buffer_size),
+        color_transfer_mode=str(color_transfer_mode),
+        shadow_correction=bool(shadow_correction),
+        shadow_clamp_min=float(shadow_clamp_min),
+        shadow_clamp_max=float(shadow_clamp_max),
+        face_restorer=str(face_restorer or "gfpgan"),
+        mask_npy_path=(str(mask_npy_path).strip() or None),
     )
 
     import threading
@@ -448,22 +476,33 @@ def _run_video_swap(source_img, target_vid,
         f"\n<details open><summary>full log</summary>\n\n```\n"
         + full_log + "\n```\n</details>"
     )
+    # T1-2: write the JSON sidecar so History tab "Restore settings"
+    # can populate the Face Swap tab from this render's knobs.
+    try:
+        previews.write_video_swap_sidecar(job, Path(out_path), elapsed)
+    except Exception as exc:
+        print(f"[T1-2] sidecar write failed: {exc}", flush=True)
+
     yield str(out_path), status
 
 # ============================================================
 # Queue handlers (Tab: Queue)
 # ============================================================
 def _enqueue_render(face, audio, face_extras,
+                     engine_choice,
                      isolate, quick, enhance, extend_single,
-                     ls_steps, ls_guidance, ls_deepcache, ls_seed,
+                     ls_steps, ls_guidance, ls_deepcache, ls_seed, ls_color_match,
                      ls_face_det,
                      voice_model, voice_transpose,
                      wm_enabled, wm_image, wm_position, wm_scale, wm_opacity,
                      ar_enabled, ar_target, ar_fill,
                      occ_enabled, occ_bbox_smooth, occ_mask_smooth,
                      occ_align, occ_feather, occ_mouth_polygon,
+                     ks_face_click_x, ks_face_click_y, ks_face_click_frame,
+                 ks_skip_crop,
                  mout_enabled_v, mout_clicks_v,
-                 mout_dilate_v, mout_feather_v):
+                 mout_dilate_v, mout_feather_v,
+                 mout_npy_override_v):
     """Build a LipsyncJob from the current Lip-Sync tab settings and
     submit it to the queue. Returns a status string."""
     if not face:
@@ -478,6 +517,7 @@ def _enqueue_render(face, audio, face_extras,
                 face_paths.append(Path(str(p)))
     lj = LipsyncJob(
         face_paths=face_paths, audio_path=Path(audio),
+        engine=str(engine_choice or "latentsync").lower(),
         isolate_vocals=bool(isolate), enhance_faces=bool(enhance),
         quick_test=bool(quick), extend_single=bool(extend_single),
         latentsync=LatentSyncKnobs(
@@ -485,12 +525,19 @@ def _enqueue_render(face, audio, face_extras,
             guidance_scale=float(ls_guidance),
             enable_deepcache=bool(ls_deepcache),
             seed=int(ls_seed),
-            face_det_threshold=float(ls_face_det)),
+            face_det_threshold=float(ls_face_det),
+            color_match_mode=str(ls_color_match or "reinhard")),
+        keysync=KeySyncKnobs(
+            face_click_x=int(ks_face_click_x or 0),
+            face_click_y=int(ks_face_click_y or 0),
+            face_click_frame=int(ks_face_click_frame or 0),
+            skip_crop=bool(ks_skip_crop)),
         maskout=MaskOutConfig(
             enabled=bool(mout_enabled_v),
             clicks=list(mout_clicks_v or []),
             dilate_px=int(mout_dilate_v),
-            feather=int(mout_feather_v)),
+            feather=int(mout_feather_v),
+            mask_npy_path=str(mout_npy_override_v or "")),
         voice_swap=VoiceSwap(
             model_basename=("" if (not voice_model
                                     or voice_model == _VOICE_NONE)
@@ -588,7 +635,7 @@ def build() -> gr.Blocks:
   btn.innerHTML = '\\u{1F4F7} Capture full page';
   btn.title = 'Save a PNG of the entire scrollable UI';
   btn.style.cssText = (
-    'position:fixed;top:12px;right:12px;z-index:10000;' +
+    'position:fixed;bottom:12px;right:12px;z-index:10000;' +
     'background:rgba(40,40,40,0.92);color:#fff;border:1px solid #555;' +
     'padding:8px 14px;border-radius:6px;cursor:pointer;' +
     'font:13px system-ui,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,0.3)'
@@ -713,6 +760,69 @@ def build() -> gr.Blocks:
                                 value=False,
                             )
 
+                        gr.Markdown("### Engine")
+                        with gr.Group():
+                            engine = gr.Dropdown(
+                                choices=[
+                                    "latentsync",
+                                    "keysync",
+                                ],
+                                value="latentsync",
+                                label="Lipsync engine",
+                                info="latentsync = HUMAN speech / singing "
+                                     "(fast, ~5 min). keysync = NON-HUMAN "
+                                     "characters (cartoons, stylized art, "
+                                     "animals; ~15 min, runs in its own "
+                                     "venv).",
+                            )
+
+                        # ---- KeySync non-human face ROI (SAM2 click) ----
+                        # Visible only when engine == "keysync". User
+                        # clicks on the character's face in the preview
+                        # image -- SAM2 propagates that click across the
+                        # whole video so KeySync sees a clean face crop
+                        # regardless of the SFD detector failing on
+                        # cartoons / animals. (0,0) = auto detect.
+                        with gr.Group(visible=False) as ks_face_group:
+                            gr.Markdown(
+                                "### KeySync non-human face ROI\n"
+                                "Click once on the character's face in "
+                                "the preview below. SAM2 will track "
+                                "that point across the whole video. "
+                                "Use this when the face detector "
+                                "can't find a face (cartoons, statues, "
+                                "stylized art, animals).")
+                            ks_face_preview = gr.Image(
+                                label="Preview frame (click the face)",
+                                type="filepath",
+                                interactive=True,
+                                height=320,
+                            )
+                            with gr.Row():
+                                ks_face_click_x = gr.Number(
+                                    value=0, precision=0,
+                                    label="face click X (px)")
+                                ks_face_click_y = gr.Number(
+                                    value=0, precision=0,
+                                    label="face click Y (px)")
+                                ks_face_click_frame = gr.Number(
+                                    value=0, precision=0,
+                                    label="preview frame index")
+                            ks_face_reset_btn = gr.Button(
+                                "reset face click", size="sm")
+                            ks_skip_crop = gr.Checkbox(
+                                label="Skip KeySync crop_video.py "
+                                      "(use source as-is, no face crop)",
+                                value=False,
+                                info="Bypass KeySync's landmark-based "
+                                     "crop step entirely. Required test "
+                                     "path for human face at native "
+                                     "resolution. Auto-on when a face "
+                                     "click is supplied (SAM2 already "
+                                     "cropped). Tick manually to test "
+                                     "without any cropping at all.",
+                            )
+
                         # ---- SAM2 multi-click mask-out (non-face objects) ----
                         # RE-ENABLED 2026-06-05 after fixing the
                         # fps-ratio drift bug in composite_back.
@@ -766,6 +876,16 @@ def build() -> gr.Blocks:
                                     label="Composite feather (px)",
                                     info="Gaussian feather at the mask "
                                          "edge during paste-back.")
+                            mout_npy_override = gr.Textbox(
+                                value="",
+                                label="Pre-computed mask NPY (optional)",
+                                placeholder="Paste a path from the "
+                                            "Rotoscoping tab, or leave "
+                                            "empty to run SAM2 from "
+                                            "clicks above.",
+                                info="When set + file exists, Stage "
+                                     "1.76 skips the SAM2 worker and "
+                                     "uses this mask directly.")
 
                         gr.Markdown("### LatentSync knobs")
                         with gr.Group():
@@ -790,6 +910,14 @@ def build() -> gr.Blocks:
                                 value=-1, precision=0, label="Seed",
                                 info="-1 = random; any int = "
                                      "reproducible.")
+                            # T1-NEW color match dropdown
+                            ls_color_match = gr.Dropdown(
+                                label="Color match (post-LatentSync)",
+                                choices=["reinhard", "none"],
+                                value="reinhard",
+                                info="Fixes stylized-source -> orange-cheek "
+                                     "VAE drift.  Reinhard = match face LAB "
+                                     "to source.  None = disable.")
                             ls_face_det = gr.Slider(
                                 0.30, 0.95, value=0.5, step=0.05,
                                 label="Face detection threshold",
@@ -964,6 +1092,11 @@ def build() -> gr.Blocks:
                         out_video = gr.Video(
                             label="Result", interactive=False,
                             show_download_button=True, height=320)
+                        # T1-1 cross-tab handoff: take the lipsync output
+                        # and use it as the target video on Face Swap.
+                        ls_send_to_fs_btn = gr.Button(
+                            "Send result to Face Swap →",
+                            variant="secondary", size="sm")
                         eta_md = gr.Markdown(
                             "**ETA:** drop a face clip to see ETA")
                         with gr.Row():
@@ -997,8 +1130,9 @@ def build() -> gr.Blocks:
                 render_btn.click(
                     fn=_run_render,
                     inputs=[face, audio, face_extras,
+                            engine,
                             isolate, quick, enhance, extend_single,
-                            ls_steps, ls_guidance, ls_deepcache, ls_seed,
+                            ls_steps, ls_guidance, ls_deepcache, ls_seed, ls_color_match,
                             ls_face_det,
                             voice_model, voice_transpose,
                             wm_enabled, wm_image, wm_position,
@@ -1007,8 +1141,11 @@ def build() -> gr.Blocks:
                             occ_enabled, occ_bbox_smooth,
                             occ_mask_smooth, occ_align,
                             occ_feather, occ_mouth_polygon,
+                            ks_face_click_x, ks_face_click_y,
+                            ks_face_click_frame, ks_skip_crop,
                             mout_enabled, mout_clicks_state,
-                            mout_dilate, mout_feather],
+                            mout_dilate, mout_feather,
+                            mout_npy_override],
                     outputs=[out_video, out_status, gr.State()],
                 )
                 cancel_btn.click(
@@ -1019,8 +1156,9 @@ def build() -> gr.Blocks:
                 queue_btn.click(
                     fn=_enqueue_render,
                     inputs=[face, audio, face_extras,
+                            engine,
                             isolate, quick, enhance, extend_single,
-                            ls_steps, ls_guidance, ls_deepcache, ls_seed,
+                            ls_steps, ls_guidance, ls_deepcache, ls_seed, ls_color_match,
                             ls_face_det,
                             voice_model, voice_transpose,
                             wm_enabled, wm_image, wm_position,
@@ -1029,9 +1167,91 @@ def build() -> gr.Blocks:
                             occ_enabled, occ_bbox_smooth,
                             occ_mask_smooth, occ_align,
                             occ_feather, occ_mouth_polygon,
+                            ks_face_click_x, ks_face_click_y,
+                            ks_face_click_frame, ks_skip_crop,
                             mout_enabled, mout_clicks_state,
-                            mout_dilate, mout_feather],
+                            mout_dilate, mout_feather,
+                            mout_npy_override],
                     outputs=[out_status],
+                )
+
+                # ---- KeySync face-ROI widget plumbing ----
+                # (a) toggle the ks_face_group on engine selection
+                # (b) on face_video change, extract frame 0 to use as
+                #     the click target preview
+                # (c) capture (x,y) from a click on the preview into
+                #     the hidden Number widgets
+                # (d) reset button clears the click coords
+                def _on_engine_change(eng):
+                    is_ks = (str(eng or "").lower() == "keysync")
+                    return gr.update(visible=is_ks)
+                engine.change(
+                    fn=_on_engine_change,
+                    inputs=[engine],
+                    outputs=[ks_face_group],
+                )
+
+                def _on_face_change_for_ks(face_path, eng):
+                    """Reset KeySync click coords on face change.
+
+                    NOTE: We deliberately do NOT read the video here.
+                    Previously this opened the file with cv2 to extract
+                    frame 0 as a PNG for the click target. On Windows
+                    that left a brief file handle that could race with
+                    Gradio's HTML5 video preview server, surfacing as
+                    "Error - Video not playable" in the upload widget.
+                    The frame extraction now runs lazily inside
+                    _on_engine_change when the user actually switches
+                    to KeySync mode (see ks_load_frame_now below).
+                    """
+                    return gr.update(), 0, 0, 0
+                face.change(
+                    fn=_on_face_change_for_ks,
+                    inputs=[face, engine],
+                    outputs=[ks_face_preview, ks_face_click_x,
+                             ks_face_click_y, ks_face_click_frame],
+                )
+
+                def _ks_load_frame_now(face_path, eng):
+                    """Extract frame 0 from the face video as a PNG for
+                    the KeySync click-target preview. Triggered when
+                    the engine dropdown is set to 'keysync' (i.e. the
+                    user actually opens the KeySync workflow), so we
+                    don't pay the cv2 read cost on the default LatentSync
+                    path. Wrapped in try/finally so the cv2 handle is
+                    always released even on exceptions, eliminating
+                    the file-lock race with Gradio's video player.
+                    """
+                    if not face_path:
+                        return gr.update(value=None)
+                    if str(eng or "").lower() != "keysync":
+                        return gr.update()
+                    cap = None
+                    try:
+                        import cv2 as _cv2, tempfile as _tmp, os as _os
+                        cap = _cv2.VideoCapture(str(face_path))
+                        ok, frm = cap.read()
+                        if not ok or frm is None:
+                            return gr.update(value=None)
+                        fd, png = _tmp.mkstemp(
+                            suffix="_ks_preview.png")
+                        _os.close(fd)
+                        _cv2.imwrite(png, frm)
+                        return gr.update(value=png)
+                    except Exception:
+                        return gr.update(value=None)
+                    finally:
+                        # Release ALWAYS so no handle lingers on Windows.
+                        try:
+                            if cap is not None:
+                                cap.release()
+                        except Exception:
+                            pass
+                # Wire on engine change AND once on initial keysync entry.
+                engine.change(
+                    fn=_ks_load_frame_now,
+                    inputs=[face, engine],
+                    outputs=[ks_face_preview],
                 )
 
                 # ---- SAM2 mask-out wiring ----
@@ -1216,6 +1436,28 @@ def build() -> gr.Blocks:
                     outputs=[ft_status, ft_log],
                 )
 
+                def _on_ks_face_click(evt: gr.SelectData):
+                    """Gradio Image .select() callback. evt.index is
+                    (x, y) in image pixel coords."""
+                    try:
+                        x, y = int(evt.index[0]), int(evt.index[1])
+                    except Exception:
+                        return 0, 0
+                    return x, y
+                ks_face_preview.select(
+                    fn=_on_ks_face_click,
+                    inputs=None,
+                    outputs=[ks_face_click_x, ks_face_click_y],
+                )
+
+                def _on_ks_reset():
+                    return 0, 0, 0
+                ks_face_reset_btn.click(
+                    fn=_on_ks_reset,
+                    inputs=None,
+                    outputs=[ks_face_click_x, ks_face_click_y,
+                             ks_face_click_frame],
+                )
                 preview_pp_btn.click(
                     fn=_preview_post_output,
                     inputs=[face, wm_enabled, wm_image, wm_position,
@@ -1230,7 +1472,7 @@ def build() -> gr.Blocks:
                     inputs=[preset_dd_inline],
                     outputs=[isolate, quick, enhance, extend_single,
                              ls_steps, ls_guidance, ls_deepcache,
-                             ls_seed, voice_model, voice_transpose,
+                             ls_seed, ls_color_match, voice_model, voice_transpose,
                              out_status])
 
             # ====================================================
@@ -1285,8 +1527,36 @@ def build() -> gr.Blocks:
                                      "blend. alpha/feather = soft "
                                      "alpha. none = hard paste.")
                             vs_enhance = gr.Checkbox(
-                                label="Enhance faces (GFPGAN)",
+                                label="Enhance faces",
                                 value=False)
+                            # T2-2 face-restoration backend dropdown
+                            vs_restorer = gr.Dropdown(
+                                label="Face restoration backend",
+                                choices=[
+                                    "none",
+                                    "gfpgan",
+                                    "codeformer",
+                                    "restoreformer",
+                                ],
+                                value="gfpgan",
+                                info="GFPGAN = in-pipeline (default). "
+                                     "CodeFormer = post-process, often "
+                                     "sharper eyes. RestoreFormer = "
+                                     "NOT installed yet (stub).  Only "
+                                     "runs when Enhance faces is on.")
+                            # T2-NEW: rotoscope mask region restriction
+                            vs_mask_npy = gr.Textbox(
+                                label="Restrict swap to rotoscope mask (NPY, optional)",
+                                placeholder=(
+                                    "e.g. .../rotoscope/<hash>/masks/"
+                                    "obj_1_combined.npy"),
+                                info=("Drops detected faces whose "
+                                       "bbox centroid lands outside "
+                                       "the mask.  Use this when "
+                                       "multi-face frames pick up "
+                                       "unwanted subjects (animals, "
+                                       "extras, statues).  Empty = "
+                                       "no gating."))
                             vs_det_thresh = gr.Slider(
                                 0.1, 0.9, value=0.5, step=0.05,
                                 label="Detection threshold")
@@ -1394,6 +1664,69 @@ def build() -> gr.Blocks:
                                      "plasticky skin.")
 
                         with gr.Accordion(
+                                "Temporal smoothing (face flicker)",
+                                open=False):
+                            gr.Markdown(
+                                "Reduce frame-to-frame face flicker. "
+                                "Already on by default (EMA 0.85 on the "
+                                "face region). Tune here to dial the "
+                                "strength up for static shots or down "
+                                "for fast motion.")
+                            vs_temporal_enabled = gr.Checkbox(
+                                label="Enable temporal smoothing",
+                                value=True)
+                            vs_temporal_ema = gr.Slider(
+                                0.0, 0.98, value=0.85, step=0.01,
+                                label="EMA decay (smoothing strength)",
+                                info="Higher = more smoothing, more "
+                                     "lag on motion. 0.85 = stock. "
+                                     "Try 0.92+ for static shots, "
+                                     "0.6-0.75 for fast motion.")
+                            vs_temporal_buffer = gr.Slider(
+                                1, 15, value=5, step=1,
+                                label="Buffer size (frames)",
+                                info="History depth for optical-flow "
+                                     "context. 5 = stock. Larger "
+                                     "buffers use more RAM but help "
+                                     "on long jitter periods.")
+
+                        with gr.Accordion(
+                                "Lighting / color match",
+                                open=False):
+                            gr.Markdown(
+                                "Match the swapped face to the scene\'s "
+                                "color + shadow. Reinhard color transfer "
+                                "and SH-relit shadow correction both run "
+                                "by default; tune here if the swap looks "
+                                "'pasted on'.")
+                            vs_color_transfer_mode = gr.Dropdown(
+                                choices=["reinhard", "none"],
+                                value="reinhard",
+                                label="Color transfer mode",
+                                info="reinhard = match swap LAB-color "
+                                     "stats to the original face region. "
+                                     "Set to none if the source already "
+                                     "matches the scene and the "
+                                     "transfer is making colors worse.")
+                            vs_shadow_correction = gr.Checkbox(
+                                label="Shadow correction",
+                                value=True,
+                                info="Apply the original face's lighting "
+                                     "envelope to the swap. Helps in "
+                                     "harsh side-lit or dim scenes.")
+                            with gr.Row():
+                                vs_shadow_clamp_min = gr.Slider(
+                                    0.1, 1.0, value=0.5, step=0.05,
+                                    label="Shadow clamp min",
+                                    info="Lower = darker possible "
+                                         "shadows.")
+                                vs_shadow_clamp_max = gr.Slider(
+                                    1.0, 3.0, value=1.5, step=0.05,
+                                    label="Shadow clamp max",
+                                    info="Higher = brighter possible "
+                                         "highlights.")
+
+                        with gr.Accordion(
                                 "Identity blend / journey (optional)",
                                 open=False):
                             gr.Markdown(
@@ -1444,6 +1777,11 @@ def build() -> gr.Blocks:
                         vs_out_video = gr.Video(
                             label="Result", interactive=False,
                             show_download_button=True, height=320)
+                        # T1-1 cross-tab handoff: take the face-swap
+                        # output and use it as the face clip on Lip-Sync.
+                        fs_send_to_ls_btn = gr.Button(
+                            "Send result to Lip-Sync →",
+                            variant="secondary", size="sm")
                         vs_btn = gr.Button(
                             "\u25b6 Run face swap",
                             variant="primary", size="lg")
@@ -1462,7 +1800,12 @@ def build() -> gr.Blocks:
                             vs_mask_padding, vs_mask_blur,
                             vs_swap_strength, vs_enhancer_blend,
                             vs_selector_mode, vs_reference_face,
-                            vs_reference_distance, vs_pixel_boost],
+                            vs_reference_distance, vs_pixel_boost,
+                            vs_temporal_enabled, vs_temporal_ema,
+                            vs_temporal_buffer,
+                            vs_color_transfer_mode, vs_shadow_correction,
+                            vs_shadow_clamp_min, vs_shadow_clamp_max,
+                            vs_restorer, vs_mask_npy],
                     outputs=[vs_out_video, vs_status])
 
                 # Mirror reference face upload into its thumbnail.
@@ -1499,6 +1842,26 @@ def build() -> gr.Blocks:
                 # ui.stream_server anywhere.
                 from .webcam.ui import build_tab as _v2_webcam_tab
                 _v2_webcam_tab()
+            # TAB 3.75: Rotoscoping (Phase 1 MVP)
+            # ====================================================
+            # SAM2-backed segmentation + propagation.  Produces a
+            # mask sequence that the Lip-Sync tab can consume via
+            # the existing mask-out / composite-back pipeline.
+            # Source: faceswap/rotoscope/ui.py.  Uses the SAM2
+            # daemon (core/sam2_daemon.py) for sub-second clicks
+            # after warmup, and the frame cache
+            # (core/rotoscope_cache.py) for instant scrub.
+            with gr.Tab("🪒 Rotoscoping"):
+                from .rotoscope.ui import build_tab as _roto_tab
+                # T1-1 + T2-NEW handoff: rotoscope's "Send masks" button
+                # writes the NPY path into BOTH the Lip-Sync mask-out
+                # textbox AND the Face Swap region-restrict textbox.
+                _roto_tab(lipsync_npy_target=mout_npy_override,
+                            faceswap_npy_target=vs_mask_npy)
+            # (Creature Swap tab ripped out 2026-06-11 -- pipeline
+            # could not handle non-human anatomies; both SAM2 mask
+            # centroid and Lucas-Kanade point tracking failed on
+            # stylized creatures.  See WORKLOG.)
             # TAB 3.5: Queue (batch render)
             # ====================================================
             with gr.Tab("📦 Queue"):
@@ -1557,11 +1920,65 @@ def build() -> gr.Blocks:
                             show_download_button=True, height=380)
                     with gr.Column(scale=1):
                         hist_meta = gr.Markdown("_(none selected)_")
+                # T1-2 restore button: read the selected mp4's sidecar
+                # and dispatch every saved knob value back into the
+                # source tab's widgets.
+                hist_restore_btn = gr.Button(
+                    "🔧 Restore settings to source tab",
+                    variant="secondary", size="sm")
+                hist_restore_status = gr.Markdown(
+                    "_Select a past render above, then click Restore "
+                    "to push its knob values back into the Lip-Sync "
+                    "or Face Swap tab (based on the render kind)._")
                 refresh_btn.click(fn=_refresh_history,
                                   outputs=[hist_dd])
                 hist_dd.change(fn=_on_history_select,
                                inputs=[hist_dd],
                                outputs=[hist_video, hist_meta])
+
+            # ====================================================
+            # TAB 4.5: Projects (T1-3) -- session bundle: every knob
+            # value across Lip-Sync + Face Swap saved to a single
+            # project.json, restorable in one click across both tabs.
+            # ====================================================
+            with gr.Tab("📂 Projects"):
+                gr.Markdown("### Project sessions")
+                gr.Markdown(
+                    "_Save the **current Lip-Sync + Face Swap** "
+                    "settings as a named project.  Open it later to "
+                    "restore every knob value across both tabs in one "
+                    "click.  Projects live under `v2/projects/`._\n\n"
+                    "_File paths are noted in project.json for "
+                    "reference but files are NOT auto-copied (MVP).  "
+                    "If you move source / target files later, "
+                    "re-upload them after Open._")
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        gr.Markdown("**Save current settings**")
+                        proj_save_name = gr.Textbox(
+                            label="Save as",
+                            placeholder="e.g. acme-promo-spot-q3")
+                        proj_save_btn = gr.Button(
+                            "💾 Save current settings as project",
+                            variant="primary")
+                        proj_save_status = gr.Markdown("")
+                    with gr.Column(scale=1):
+                        gr.Markdown("**Open / manage existing projects**")
+                        from . import projects as _projects_module
+                        proj_dd = gr.Dropdown(
+                            choices=_projects_module.list_projects(),
+                            value=None,
+                            label="Existing projects (newest first)",
+                            allow_custom_value=False, interactive=True)
+                        with gr.Row():
+                            proj_refresh = gr.Button("🔄 Refresh",
+                                                       size="sm")
+                            proj_open_btn = gr.Button(
+                                "📂 Open project",
+                                variant="secondary")
+                            proj_delete_btn = gr.Button(
+                                "🗑 Delete", variant="stop", size="sm")
+                        proj_manage_status = gr.Markdown("")
 
             # ====================================================
             # TAB 5: Presets (full management)
@@ -1658,6 +2075,302 @@ def build() -> gr.Blocks:
                     inputs=[min_age],
                     outputs=[cache_out],
                 )
+
+        # ---- T1-2 History "Restore settings" wiring (defined after all
+        # tabs so widget refs from Lip-Sync + Face Swap are in scope).
+        # The function reads the selected mp4's sidecar JSON and returns
+        # a flat tuple of gr.update() calls -- one per output widget in
+        # the order they're bound below.
+        def _on_history_restore(selected_path):
+            import gradio as _gr
+            n_outs = 33  # MUST match outputs= list below
+            noop = [_gr.update() for _ in range(n_outs)]
+            if not selected_path:
+                return tuple(noop) + ("_Restore: nothing selected._",)
+            try:
+                sc = previews.load_sidecar(Path(selected_path))
+            except Exception as exc:
+                return tuple(noop) + (f"_Restore: load failed: {exc}_",)
+            if sc is None:
+                return tuple(noop) + (
+                    "_Restore: no sidecar found for that render._",)
+            kind = sc.get("kind", "lipsync")
+            updates = list(noop)
+            # Output order (must match outputs= list below):
+            #   0..7  -- lipsync widgets
+            #   8..32 -- face-swap widgets
+            if kind == "lipsync":
+                ls = sc.get("latentsync", {}) or {}
+                updates[0] = _gr.update(value=bool(sc.get("isolate_vocals", True)))
+                updates[1] = _gr.update(value=bool(sc.get("quick_test", False)))
+                updates[2] = _gr.update(value=bool(sc.get("enhance_faces", True)))
+                updates[3] = _gr.update(value=bool(sc.get("extend_single", False)))
+                updates[4] = _gr.update(value=int(ls.get("inference_steps", 20)))
+                updates[5] = _gr.update(value=float(ls.get("guidance_scale", 1.5)))
+                updates[6] = _gr.update(value=bool(ls.get("deepcache", True)))
+                updates[7] = _gr.update(value=int(ls.get("seed", -1)))
+                status = (f"_Restored Lip-Sync settings from "
+                           f"`{Path(selected_path).name}` "
+                           f"(steps={ls.get('inference_steps', '?')}, "
+                           f"seed={ls.get('seed', '?')})._")
+            elif kind == "face_swap":
+                g = lambda k, d=None: sc.get(k, d)
+                updates[8]  = _gr.update(value=str(g("blend_method", "poisson")))
+                updates[9]  = _gr.update(value=bool(g("enhance_faces", False)))
+                updates[10] = _gr.update(value=float(g("det_threshold", 0.5)))
+                updates[11] = _gr.update(value=str(g("output_quality",
+                                                        "visually_lossless")))
+                updates[12] = _gr.update(value=int(g("trim_start_frame", 0)))
+                updates[13] = _gr.update(value=int(g("trim_end_frame", 0)))
+                updates[14] = _gr.update(value=str(g("selector_mode", "largest")))
+                updates[15] = _gr.update(value=float(g("reference_distance", 0.6)))
+                updates[16] = _gr.update(value=int(g("pixel_boost", 128)))
+                updates[17] = _gr.update(value=int(g("mask_padding", 0)))
+                updates[18] = _gr.update(value=float(g("mask_blur", 1.0)))
+                updates[19] = _gr.update(value=float(g("swap_strength", 1.0)))
+                updates[20] = _gr.update(value=float(g("enhancer_blend", 1.0)))
+                updates[21] = _gr.update(value=bool(g("temporal_enabled", True)))
+                updates[22] = _gr.update(value=float(g("temporal_ema_decay", 0.85)))
+                updates[23] = _gr.update(value=int(g("temporal_buffer_size", 5)))
+                updates[24] = _gr.update(value=str(g("color_transfer_mode",
+                                                        "reinhard")))
+                updates[25] = _gr.update(value=bool(g("shadow_correction", True)))
+                updates[26] = _gr.update(value=float(g("shadow_clamp_min", 0.5)))
+                updates[27] = _gr.update(value=float(g("shadow_clamp_max", 1.5)))
+                updates[28] = _gr.update(value=float(g("blend_alpha", 0.5)))
+                updates[29] = _gr.update(value=bool(g("journey_mode", False)))
+                updates[30] = _gr.update(value=float(g("journey_start_alpha", 0.0)))
+                updates[31] = _gr.update(value=float(g("journey_end_alpha", 1.0)))
+                updates[32] = _gr.update(value=str(g("journey_curve", "linear")))
+                status = (f"_Restored Face Swap settings from "
+                           f"`{Path(selected_path).name}`._")
+            else:
+                return tuple(noop) + (f"_Restore: unknown kind={kind!r}_",)
+            return tuple(updates) + (status,)
+
+        hist_restore_btn.click(
+            fn=_on_history_restore,
+            inputs=[hist_dd],
+            outputs=[
+                # lipsync (0..7)
+                isolate, quick, enhance, extend_single,
+                ls_steps, ls_guidance, ls_deepcache, ls_seed,
+                # face-swap (8..32)
+                vs_blend, vs_enhance, vs_det_thresh, vs_quality,
+                vs_trim_start, vs_trim_end,
+                vs_selector_mode, vs_reference_distance, vs_pixel_boost,
+                vs_mask_padding, vs_mask_blur, vs_swap_strength, vs_enhancer_blend,
+                vs_temporal_enabled, vs_temporal_ema, vs_temporal_buffer,
+                vs_color_transfer_mode, vs_shadow_correction,
+                vs_shadow_clamp_min, vs_shadow_clamp_max,
+                vs_blend_alpha,
+                vs_journey_mode, vs_journey_start, vs_journey_end, vs_journey_curve,
+                # status (33)
+                hist_restore_status,
+            ],
+        )
+
+        # ---- T1-3 Projects: Save / Open / Delete / Refresh.
+        # Defined after all tabs so every Lip-Sync + Face Swap widget ref
+        # is in scope.  Save reads 33 inputs; Open returns 33 gr.updates.
+        from . import projects as _projects_mod
+
+        def _on_project_save(name,
+                               # lipsync inputs:
+                               iso, qk, eh, ex,
+                               lss, lsg, lsd, lse,
+                               # face-swap inputs:
+                               vsb, vse, vsdt, vsq,
+                               vsts, vste,
+                               vsm, vsrd, vsbp,
+                               vsmp, vsmb, vsss, vseb,
+                               vste_en, vste_em, vste_bf,
+                               vsct, vssc, vsscn, vsscx,
+                               vsba,
+                               vsjm, vsjs, vsje, vsjc):
+            if not str(name or "").strip():
+                return ("_Save: name required._",
+                         gr.update())
+            blob = {
+                "lipsync": {
+                    "isolate_vocals": bool(iso),
+                    "quick_test": bool(qk),
+                    "enhance_faces": bool(eh),
+                    "extend_single": bool(ex),
+                    "latentsync": {
+                        "inference_steps": int(lss),
+                        "guidance_scale": float(lsg),
+                        "deepcache": bool(lsd),
+                        "seed": int(lse),
+                    },
+                },
+                "face_swap": {
+                    "blend_method": str(vsb),
+                    "enhance_faces": bool(vse),
+                    "det_threshold": float(vsdt),
+                    "output_quality": str(vsq),
+                    "trim_start_frame": int(vsts),
+                    "trim_end_frame": int(vste),
+                    "selector_mode": str(vsm),
+                    "reference_distance": float(vsrd),
+                    "pixel_boost": int(vsbp),
+                    "mask_padding": int(vsmp),
+                    "mask_blur": float(vsmb),
+                    "swap_strength": float(vsss),
+                    "enhancer_blend": float(vseb),
+                    "temporal_enabled": bool(vste_en),
+                    "temporal_ema_decay": float(vste_em),
+                    "temporal_buffer_size": int(vste_bf),
+                    "color_transfer_mode": str(vsct),
+                    "shadow_correction": bool(vssc),
+                    "shadow_clamp_min": float(vsscn),
+                    "shadow_clamp_max": float(vsscx),
+                    "blend_alpha": float(vsba),
+                    "journey_mode": bool(vsjm),
+                    "journey_start_alpha": float(vsjs),
+                    "journey_end_alpha": float(vsje),
+                    "journey_curve": str(vsjc),
+                },
+            }
+            try:
+                manifest = _projects_mod.save_project(str(name), blob)
+            except Exception as exc:
+                return (f"_Save failed: {exc}_", gr.update())
+            choices = _projects_mod.list_projects()
+            # Auto-select the newly-saved project in the dropdown.
+            saved_name = _projects_mod._safe_name(str(name))
+            status = f"_Saved `{saved_name}` → `{manifest}`_"
+            return (status,
+                     gr.update(choices=choices, value=saved_name))
+
+        proj_save_btn.click(
+            fn=_on_project_save,
+            inputs=[proj_save_name,
+                    # lipsync (8)
+                    isolate, quick, enhance, extend_single,
+                    ls_steps, ls_guidance, ls_deepcache, ls_seed,
+                    # face-swap (25)
+                    vs_blend, vs_enhance, vs_det_thresh, vs_quality,
+                    vs_trim_start, vs_trim_end,
+                    vs_selector_mode, vs_reference_distance, vs_pixel_boost,
+                    vs_mask_padding, vs_mask_blur, vs_swap_strength, vs_enhancer_blend,
+                    vs_temporal_enabled, vs_temporal_ema, vs_temporal_buffer,
+                    vs_color_transfer_mode, vs_shadow_correction,
+                    vs_shadow_clamp_min, vs_shadow_clamp_max,
+                    vs_blend_alpha,
+                    vs_journey_mode, vs_journey_start, vs_journey_end, vs_journey_curve],
+            outputs=[proj_save_status, proj_dd],
+        )
+
+        def _on_project_open(name):
+            import gradio as _gr
+            n_outs = 33
+            noop = [_gr.update() for _ in range(n_outs)]
+            if not name:
+                return tuple(noop) + ("_Open: select a project first._",)
+            blob = _projects_mod.load_project(str(name))
+            if not blob:
+                return tuple(noop) + (
+                    f"_Open: project `{name}` not found / unreadable._",)
+            ls = (blob.get("lipsync") or {}) if isinstance(blob, dict) else {}
+            ls_inner = ls.get("latentsync") or {}
+            fs = (blob.get("face_swap") or {}) if isinstance(blob, dict) else {}
+            updates = list(noop)
+            # Lipsync (0..7)
+            updates[0] = _gr.update(value=bool(ls.get("isolate_vocals", True)))
+            updates[1] = _gr.update(value=bool(ls.get("quick_test", False)))
+            updates[2] = _gr.update(value=bool(ls.get("enhance_faces", True)))
+            updates[3] = _gr.update(value=bool(ls.get("extend_single", False)))
+            updates[4] = _gr.update(value=int(ls_inner.get("inference_steps", 20)))
+            updates[5] = _gr.update(value=float(ls_inner.get("guidance_scale", 1.5)))
+            updates[6] = _gr.update(value=bool(ls_inner.get("deepcache", True)))
+            updates[7] = _gr.update(value=int(ls_inner.get("seed", -1)))
+            # Face-swap (8..32)
+            g = lambda k, d=None: fs.get(k, d)
+            updates[8]  = _gr.update(value=str(g("blend_method", "poisson")))
+            updates[9]  = _gr.update(value=bool(g("enhance_faces", False)))
+            updates[10] = _gr.update(value=float(g("det_threshold", 0.5)))
+            updates[11] = _gr.update(value=str(g("output_quality", "visually_lossless")))
+            updates[12] = _gr.update(value=int(g("trim_start_frame", 0)))
+            updates[13] = _gr.update(value=int(g("trim_end_frame", 0)))
+            updates[14] = _gr.update(value=str(g("selector_mode", "largest")))
+            updates[15] = _gr.update(value=float(g("reference_distance", 0.6)))
+            updates[16] = _gr.update(value=int(g("pixel_boost", 128)))
+            updates[17] = _gr.update(value=int(g("mask_padding", 0)))
+            updates[18] = _gr.update(value=float(g("mask_blur", 1.0)))
+            updates[19] = _gr.update(value=float(g("swap_strength", 1.0)))
+            updates[20] = _gr.update(value=float(g("enhancer_blend", 1.0)))
+            updates[21] = _gr.update(value=bool(g("temporal_enabled", True)))
+            updates[22] = _gr.update(value=float(g("temporal_ema_decay", 0.85)))
+            updates[23] = _gr.update(value=int(g("temporal_buffer_size", 5)))
+            updates[24] = _gr.update(value=str(g("color_transfer_mode", "reinhard")))
+            updates[25] = _gr.update(value=bool(g("shadow_correction", True)))
+            updates[26] = _gr.update(value=float(g("shadow_clamp_min", 0.5)))
+            updates[27] = _gr.update(value=float(g("shadow_clamp_max", 1.5)))
+            updates[28] = _gr.update(value=float(g("blend_alpha", 0.5)))
+            updates[29] = _gr.update(value=bool(g("journey_mode", False)))
+            updates[30] = _gr.update(value=float(g("journey_start_alpha", 0.0)))
+            updates[31] = _gr.update(value=float(g("journey_end_alpha", 1.0)))
+            updates[32] = _gr.update(value=str(g("journey_curve", "linear")))
+            status = (f"_Opened **{name}** → restored "
+                       f"8 Lip-Sync + 25 Face Swap knobs._")
+            return tuple(updates) + (status,)
+
+        proj_open_btn.click(
+            fn=_on_project_open,
+            inputs=[proj_dd],
+            outputs=[
+                # lipsync (0..7)
+                isolate, quick, enhance, extend_single,
+                ls_steps, ls_guidance, ls_deepcache, ls_seed,
+                # face-swap (8..32)
+                vs_blend, vs_enhance, vs_det_thresh, vs_quality,
+                vs_trim_start, vs_trim_end,
+                vs_selector_mode, vs_reference_distance, vs_pixel_boost,
+                vs_mask_padding, vs_mask_blur, vs_swap_strength, vs_enhancer_blend,
+                vs_temporal_enabled, vs_temporal_ema, vs_temporal_buffer,
+                vs_color_transfer_mode, vs_shadow_correction,
+                vs_shadow_clamp_min, vs_shadow_clamp_max,
+                vs_blend_alpha,
+                vs_journey_mode, vs_journey_start, vs_journey_end, vs_journey_curve,
+                # status (33)
+                proj_manage_status,
+            ],
+        )
+
+        def _on_project_refresh():
+            return gr.update(choices=_projects_mod.list_projects())
+
+        proj_refresh.click(fn=_on_project_refresh, outputs=[proj_dd])
+
+        def _on_project_delete(name):
+            if not name:
+                return ("_Delete: select a project first._",
+                         gr.update())
+            ok = _projects_mod.delete_project(str(name))
+            msg = (f"_Deleted `{name}`._" if ok
+                    else f"_Delete failed: `{name}` not found._")
+            return (msg, gr.update(
+                choices=_projects_mod.list_projects(), value=None))
+
+        proj_delete_btn.click(
+            fn=_on_project_delete,
+            inputs=[proj_dd],
+            outputs=[proj_manage_status, proj_dd],
+        )
+
+        # ---- T1-1 cross-tab handoff wirings (defined after all tabs
+        # so widget refs are in scope).  Click → pass video path as-is.
+        ls_send_to_fs_btn.click(
+            fn=lambda v: v,
+            inputs=[out_video],
+            outputs=[vs_target],
+        )
+        fs_send_to_ls_btn.click(
+            fn=lambda v: v,
+            inputs=[vs_out_video],
+            outputs=[face],
+        )
 
     app.queue()
     return app

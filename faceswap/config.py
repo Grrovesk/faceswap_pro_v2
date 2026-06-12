@@ -24,6 +24,11 @@ class LatentSyncKnobs:
     # face-like distractors (animals, statues) to filter them out so the
     # largest-face selector picks the human consistently.
     face_det_threshold: float = 0.5
+    # T1-NEW: post-LatentSync face-region Reinhard color match.  Fixes
+    # the cyan-source -> orange-cheek VAE drift artifact.  "reinhard"
+    # is default-on; "none" disables.  Runs as Stage 2.4 (after
+    # optional maskout composite, before audio remux).
+    color_match_mode: str = "reinhard"
     # Resolution is FIXED at 512 in v2 -- other values gave unusable
     # quality in production testing.
 
@@ -36,10 +41,40 @@ class VoiceSwap:
 
 
 @dataclass
+class KeySyncKnobs:
+    """KeySync-specific inference knobs.
+
+    face_click_xy: pixel coords in the SOURCE frame where the
+                   character's face is. SAM2 propagates from this
+                   click to track the face across the entire video,
+                   bypassing the human-trained face detector that
+                   fails on cartoons / non-human characters.
+                   (0, 0) = disabled (auto detection still used).
+    """
+    face_click_x: int = 0
+    face_click_y: int = 0
+    face_click_frame: int = 0
+    compute_until: int = 45
+    # skip_crop=True bypasses KeySync's crop_video.py preprocessing
+    # step entirely. Use this to test the model on native-resolution
+    # source video (no face-tight crop). Helpful for verifying whether
+    # KeySync's lipsync works on a clean human face at original
+    # resolution before paying the crop-jitter tax on stylized chars.
+    skip_crop: bool = False
+
+
+@dataclass
 class LipsyncJob:
     """Everything one render needs. Build once, pass through stages."""
     face_paths: List[Path]                  # primary + extras (>= 1)
     audio_path: Path
+
+    # Engine choice:
+    #   'latentsync' - 512px diffusion, optimized for HUMAN speech
+    #   'keysync'    - Imperial College 2025 model, works on NON-HUMAN
+    #                  characters (cartoons, stylized art, animals).
+    #                  Slower (~15min) and runs in its own venv.
+    engine: str = "latentsync"
 
     # Pipeline switches
     isolate_vocals: bool = True             # Demucs vocal stem
@@ -47,8 +82,9 @@ class LipsyncJob:
     quick_test: bool = False                # 12s trim for smoke tests
     extend_single: bool = False             # stream_loop a short clip
 
-    # LatentSync knobs
+    # Engine knobs
     latentsync: LatentSyncKnobs = field(default_factory=LatentSyncKnobs)
+    keysync: KeySyncKnobs = field(default_factory=KeySyncKnobs)
     voice_swap: VoiceSwap = field(default_factory=VoiceSwap)
     # Occlusion gate (applied AFTER lipsync render, BEFORE GFPGAN
     # enhance + aspect/watermark). FaceFusion-style XSeg matte
@@ -143,6 +179,29 @@ class VideoSwapJob:
     # GFPGAN call per face). 128 is identical to the legacy path.
     pixel_boost: int = 128
 
+    # ---- Temporal smoothing (face-region EMA in core/pipeline._stage_temporal) ----
+    # Already runs by default with ema_decay=0.85 (pipeline.py defaults);
+    # surfaced here so the user can dial it to taste from the UI.
+    # temporal_enabled:    False = skip temporal stage entirely (no smoothing).
+    # temporal_ema_decay:  0..0.99; higher = stronger frame-to-frame smoothing
+    #   (kills flicker but adds lag on fast motion).  0.85 = stock.
+    # temporal_buffer_size: number of frames kept for optical-flow context.
+    temporal_enabled: bool = True
+    temporal_ema_decay: float = 0.85
+    temporal_buffer_size: int = 5
+
+    # ---- Lighting / color match (lighting/*, runs in pipeline._stage_lighting) ----
+    # All three sub-stages run by default; surfaced for per-render tuning.
+    # color_transfer_mode:
+    #   "reinhard" = match swap LAB-color stats to original face region (stock)
+    #   "none"     = skip color matching entirely
+    # shadow_correction: apply SH-relit shadow map from original face to swap.
+    # shadow_clamp_min/max: multiplicative shadow-strength bounds.  1.0=neutral.
+    color_transfer_mode: str = "reinhard"
+    shadow_correction: bool = True
+    shadow_clamp_min: float = 0.5
+    shadow_clamp_max: float = 1.5
+
     # ---- Identity blend / journey (idea #3 + #4) ----
     # When source_image_b is set, the swap runs in embedding-blend mode.
     # The ArcFace embedding fed to inswapper_128 becomes
@@ -157,6 +216,23 @@ class VideoSwapJob:
     journey_start_alpha: float = 0.0
     journey_end_alpha: float = 1.0
     journey_curve: str = "linear"             # "linear" or "smoothstep"
+
+    # ---- Region restriction via rotoscope mask (T2-NEW, 2026-06-11) ----
+    # Path to a (N, H, W) uint8 NPY stack produced by the Rotoscoping tab
+    # ("Send masks" button).  When set + the file is valid, the face
+    # detector's output is filtered per frame: faces whose bbox centroid
+    # falls outside mask[frame_idx]>0 are dropped before the selector
+    # picks one.  This is the real fix for the multi-face problem
+    # (e.g. girl's face also applied to a gorilla beside her).
+    # None or empty string -> no gating (legacy behavior).
+    mask_npy_path: Optional[str] = None
+
+    # ---- Face restoration backend (T2-2) ----
+    # "gfpgan"        : default; in-pipeline GFPGAN at the per-frame stage
+    # "codeformer"    : CodeFormer post-process (skips in-pipeline GFPGAN)
+    # "restoreformer" : RestoreFormer++ post-process (stub until installed)
+    # "none"          : no restoration at all (overrides enhance_faces=True)
+    face_restorer: str = "gfpgan"
 
     def validate(self) -> None:
         if not Path(self.source_image).is_file():
@@ -236,6 +312,11 @@ class MaskOutConfig:
     clicks: List = field(default_factory=list)
     dilate_px: int = 12
     feather: int = 8
+    # Phase 1.5 (Rotoscoping handoff): when this points at an existing
+    # (T, H, W) uint8 .npy, Stage 1.76 SKIPS the SAM2 worker invocation
+    # and uses these masks directly.  Saves 30-60+ seconds per render
+    # by reusing rotoscope-produced masks instead of re-segmenting.
+    mask_npy_path: str = ""
 
 
 @dataclass

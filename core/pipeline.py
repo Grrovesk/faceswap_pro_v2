@@ -12,6 +12,7 @@ import os
 import time
 from collections import deque
 from pathlib import Path
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 from typing import Optional, Callable
 
 import cv2
@@ -176,7 +177,16 @@ class FaceSwapPipeline:
         # Swap model -- use SwapEngine (not raw ONNX session)
         swap_model = swap_cfg.get("model", "inswapper_128")
         model_path = self._find_model(swap_model)
-        self.swap_engine = SwapEngine(
+        # Phase 1 of multi-backend roadmap (Tier 1 #1): route through
+        # the swap_backends factory so GHOST-A / SimSwap-512 backends
+        # can register and the UI can pick between them.  Default is
+        # "inswapper_128" which resolves to InswapperBackend, a thin
+        # subclass of SwapEngine -- behavior is byte-identical when
+        # no backend override is set in config.
+        from core.swap_backends import get_backend
+        swap_backend_name = swap_cfg.get("backend", "inswapper_128")
+        BackendCls = get_backend(swap_backend_name)
+        self.swap_engine = BackendCls(
             model_path=model_path,
             device_id=gpu_id,
             use_tensorrt=opt_cfg.get("use_tensorrt", False),
@@ -323,6 +333,37 @@ class FaceSwapPipeline:
                     "%s -- falling back to largest-face mode",
                     ref_path, exc)
                 self._selector_mode = "largest"
+
+        # ---- T2-NEW Region restriction via rotoscope mask ----
+        # Load the (N, H, W) uint8 stack if a path was provided.  On any
+        # failure, log + null out -> no gating, same as legacy.
+        self._mask_stack = None
+        mg_cfg = self.cfg.get("mask_gate", {}) or {}
+        mg_path = mg_cfg.get("npy_path")
+        if mg_path:
+            try:
+                from pathlib import Path as _P
+                _mp = _P(mg_path)
+                if _mp.is_file():
+                    arr = np.load(str(_mp), mmap_mode="r")
+                    if arr.ndim == 3 and arr.dtype == np.uint8:
+                        self._mask_stack = arr
+                        logger.info(
+                            "Region-restriction mask loaded: %s shape=%s",
+                            mg_path, tuple(arr.shape))
+                    else:
+                        logger.warning(
+                            "Region-restriction mask ignored: "
+                            "expected (N,H,W) uint8, got %s %s",
+                            arr.shape, arr.dtype)
+                else:
+                    logger.warning(
+                        "Region-restriction mask path does not exist: %s",
+                        mg_path)
+            except Exception as exc:
+                logger.warning(
+                    "Region-restriction mask load failed: %s -- gating disabled",
+                    exc)
 
         # -- Extract source embedding and set it on the swap engine --
         if source_embedding_override is not None:
@@ -624,6 +665,69 @@ class FaceSwapPipeline:
         return max(faces,
                     key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
 
+    def _filter_faces_by_mask(self, faces, frame_idx, frame_hw):
+        """T2-NEW. Drop detected faces whose bbox centroid is OUTSIDE
+        the mask for this frame.  Returns the filtered list (possibly
+        empty).  No-op if mask stack isn't loaded.
+
+        Diagnostic logging: at frame 0 + every 25th frame, log how many
+        faces went in, how many came out, and the (cx, cy, mask_value)
+        of every detected face.  Lets the user see immediately whether
+        the rotoscope mask is actually gating the unwanted faces or
+        letting them through (mask is over-generous -> tighten the
+        rotoscope click; or the gorilla bbox centroid happens to land
+        inside the girl-mask -> add a negative click).
+        """
+        if self._mask_stack is None or not faces:
+            return faces
+        n, mh, mw = self._mask_stack.shape
+        if int(frame_idx) >= n:
+            return faces
+        mask = np.asarray(self._mask_stack[int(frame_idx)])
+        H, W = frame_hw
+        if (mh, mw) != (H, W):
+            try:
+                import cv2 as _cv
+                mask = _cv.resize(mask, (W, H),
+                                    interpolation=_cv.INTER_NEAREST)
+            except Exception:
+                return faces  # be permissive on resize failure
+
+        diag = (int(frame_idx) == 0 or int(frame_idx) % 25 == 0)
+        decisions = []
+        out = []
+        for f in faces:
+            try:
+                x1, y1, x2, y2 = f.bbox
+                cx = int(max(0, min(W - 1, (x1 + x2) * 0.5)))
+                cy = int(max(0, min(H - 1, (y1 + y2) * 0.5)))
+            except Exception:
+                out.append(f)
+                if diag:
+                    decisions.append("(bbox-bad, kept)")
+                continue
+            mv = int(mask[cy, cx])
+            keep = mv > 0
+            if keep:
+                out.append(f)
+            if diag:
+                bbox_area = (
+                    (float(x2) - float(x1))
+                    * (float(y2) - float(y1)))
+                decisions.append(
+                    f"({cx},{cy}) mask_v={mv} "
+                    f"bbox={int(bbox_area)}px "
+                    f"-> {'KEEP' if keep else 'DROP'}")
+
+        if diag:
+            mask_white_pct = float((mask > 0).mean()) * 100.0
+            logger.info(
+                "[mask-gate] frame %d: %d faces in -> %d out  "
+                "(mask coverage %.1f%% of frame)  %s",
+                int(frame_idx), len(faces), len(out),
+                mask_white_pct, " | ".join(decisions))
+        return out
+
     def _stage_detect(self, pkt: FramePacket) -> None:
         """Detect face, extract landmarks, compute alignment matrix.
 
@@ -635,6 +739,16 @@ class FaceSwapPipeline:
             try:
                 ifaces = self._insightface_app.get(pkt.frame_bgr)
                 if ifaces:
+                    # T2-NEW: drop faces outside the rotoscope mask for
+                    # this frame (if a mask stack was loaded).  Done BEFORE
+                    # selector_mode picks one, so reference/largest see
+                    # only the gated set.
+                    if self._mask_stack is not None:
+                        ifaces = self._filter_faces_by_mask(
+                            ifaces, pkt.frame_idx,
+                            pkt.frame_bgr.shape[:2])
+                        if not ifaces:
+                            return  # all faces outside mask -> skip frame
                     face = self._pick_face(ifaces, pkt.frame_idx)
                     if face is None:
                         return  # reference mode: nothing matched, skip swap
@@ -858,6 +972,8 @@ class FaceSwapPipeline:
                         swap_strength * swapped_frame.astype(np.float32)
                         + (1.0 - swap_strength) * pkt.frame_bgr.astype(np.float32)
                     ).clip(0, 255).astype(np.uint8)
+
+
                 pkt.output_frame = swapped_frame
                 return
             except Exception as exc:

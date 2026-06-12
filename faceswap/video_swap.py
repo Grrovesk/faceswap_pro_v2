@@ -50,8 +50,23 @@ def _build_cfg(job: VideoSwapJob) -> dict:
             "quality": _QUALITY_MAP.get(job.output_quality,
                                           "visually_lossless"),
         },
+        "mask_gate": {
+            # T2-NEW: rotoscope mask region restriction.  Pipeline
+            # loads this stack at init time and filters detected faces
+            # per frame by bbox-centroid containment.
+            "npy_path": str(getattr(job, "mask_npy_path", "") or ""),
+        },
         "enhancement": {
-            "method": "gfpgan" if job.enhance_faces else "none",
+            # T2-2: only request in-pipeline GFPGAN if the chosen
+            # restorer IS GFPGAN.  Other restorers run as a video-
+            # level post-process after the pipeline returns.
+            "method": (
+                "gfpgan"
+                if (job.enhance_faces
+                    and str(getattr(job, "face_restorer", "gfpgan"))
+                        .lower() == "gfpgan")
+                else "none"
+            ),
             "blend": float(job.enhancer_blend),
         },
         "selector": {
@@ -62,6 +77,21 @@ def _build_cfg(job: VideoSwapJob) -> dict:
         },
         "swap": {
             "pixel_boost": int(job.pixel_boost),
+        },
+        # Temporal smoothing runs by default in core/pipeline._stage_temporal.
+        # Knobs are surfaced via VideoSwapJob so the UI can tune them.
+        "temporal": {
+            "enabled":     bool(job.temporal_enabled),
+            "ema_decay":   float(job.temporal_ema_decay),
+            "buffer_size": int(job.temporal_buffer_size),
+        },
+        # Lighting / color match runs by default in pipeline._stage_lighting.
+        # Reinhard LAB color transfer + SH-relit shadow correction.
+        "lighting": {
+            "color_transfer":    str(job.color_transfer_mode),
+            "shadow_correction": bool(job.shadow_correction),
+            "shadow_clamp_min":  float(job.shadow_clamp_min),
+            "shadow_clamp_max":  float(job.shadow_clamp_max),
         },
     }
     if int(job.trim_end_frame) > 0:
@@ -132,6 +162,18 @@ def run(job: VideoSwapJob,
     if not out_path.exists() or out_path.stat().st_size < 10_000:
         raise RuntimeError(
             f"video swap produced no output at {out_path}")
+
+    # T2-2 post-process restoration if user picked a non-GFPGAN backend.
+    restorer = str(getattr(job, "face_restorer", "gfpgan")).lower()
+    if job.enhance_faces and restorer not in ("none", "gfpgan"):
+        try:
+            from core import face_restoration as _fr
+            log(f"[video-swap] post-process restoration backend={restorer}")
+            out_path = _fr.enhance(restorer, out_path, log=log)
+        except Exception as exc:
+            log(f"[video-swap] post-process restoration FAILED "
+                f"({exc}); shipping un-restored output")
+
     log(f"[video-swap] DONE -> {out_path}")
     return out_path
 

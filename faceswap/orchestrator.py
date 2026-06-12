@@ -145,10 +145,16 @@ def _render_locked(job: LipsyncJob,
     _gate_disabled = DISABLE_MASKOUT_PIPELINE
     _gate_enabled  = bool(job.maskout.enabled)
     _gate_nclicks  = len(job.maskout.clicks) if job.maskout.clicks else 0
+    # Phase 1.5: rotoscope-produced pre-computed masks count as a
+    # valid trigger -- the user supplies an NPY instead of clicks.
+    _gate_npy_override = str(
+        getattr(job.maskout, "mask_npy_path", "") or "").strip()
     log(f"[orchestrator] Stage 1.76 gate: disable_flag={_gate_disabled} "
         f"job.maskout.enabled={_gate_enabled} "
-        f"job.maskout.clicks={_gate_nclicks}")
-    if (not _gate_disabled and _gate_enabled and _gate_nclicks > 0):
+        f"job.maskout.clicks={_gate_nclicks} "
+        f"npy_override={'set' if _gate_npy_override else 'empty'}")
+    if (not _gate_disabled and _gate_enabled
+            and (_gate_nclicks > 0 or _gate_npy_override)):
         log("[orchestrator] Stage 1.76: SAM2 mask-out pre-stage")
         t0 = time.perf_counter()
         try:
@@ -175,6 +181,8 @@ def _render_locked(job: LipsyncJob,
                 dilate_px=int(job.maskout.dilate_px),
                 feather=int(job.maskout.feather),
                 log=log,
+                mask_npy_path=str(getattr(job.maskout,
+                                            "mask_npy_path", "") or ""),
             )
             # Swap face_paths so Stage 2 (LatentSync) reads the void.
             job.face_paths = [Path(result["void_video"])] + \
@@ -188,6 +196,7 @@ def _render_locked(job: LipsyncJob,
             log(f"[timing] Stage 1.76 maskout_prep took {dt:.2f}s "
                 f"(void source: {Path(result['void_video']).name})")
             stage_times.append(("Stage 1.76 maskout_prep", dt))
+
         except Exception as _mout_exc:
             log(f"[orchestrator] Stage 1.76 maskout FAILED "
                 f"({_mout_exc}); proceeding with original source")
@@ -269,6 +278,43 @@ def _render_locked(job: LipsyncJob,
                 f"({_mc_exc}); keeping raw lipsync output")
 
     _check_cancel(cancel_event, log)
+    # Stage 2.4 (T1-NEW): post-LatentSync color match.  Fixes VAE
+    # color drift that bites stylized sources (cyan-hair, anime,
+    # painted portraits) where LatentSync's output skews skin warm.
+    # Reinhard-matches the lipsync output's face region to the source
+    # video's face LAB stats.  Skipped when mode='none' or when face
+    # detection fails on too few sample frames.
+    cm_mode = str(
+        getattr(job.latentsync, "color_match_mode", "reinhard") or "none"
+    ).lower()
+    if cm_mode != "none" and job.face_paths:
+        try:
+            from core import lipsync_color_match as _cm
+            t0 = time.perf_counter()
+            src_ref = Path(job.face_paths[0])
+            matched = _cm.color_match_video(
+                source_video=src_ref,
+                latentsync_output=Path(raw),
+                mode=cm_mode,
+                log=log,
+            )
+            if Path(matched) != Path(raw) and Path(matched).is_file():
+                raw = matched
+                dt = time.perf_counter() - t0
+                log(f"[timing] Stage 2.4 color_match took {dt:.2f}s "
+                    f"-> {Path(raw).name}")
+                stage_times.append(("Stage 2.4 color_match", dt))
+            else:
+                dt = time.perf_counter() - t0
+                log(f"[timing] Stage 2.4 color_match (no-op) "
+                    f"took {dt:.2f}s")
+                stage_times.append(("Stage 2.4 color_match (no-op)",
+                                     dt))
+        except Exception as _cm_exc:
+            log(f"[orchestrator] Stage 2.4 color_match FAILED "
+                f"({_cm_exc}); keeping raw output")
+
+    _check_cancel(cancel_event, log)
     # Stage 2.5: re-mux the FINAL audio onto the lipsync video. There
     # are two triggers that make this necessary:
     #   (a) isolate_vocals=True: LatentSync drove on vocals-only, so
@@ -315,10 +361,65 @@ def _render_locked(job: LipsyncJob,
     if job.enhance_faces:
         log("[orchestrator] GFPGAN post-step starting...")
         t0 = time.perf_counter()
+        # Remember the pre-GFPGAN file as the audio donor.  GFPGAN's
+        # worker writes via `ffmpeg ... -an` (audio disabled, raw
+        # frame pipe with no audio input) so its output is silent.
+        # If the file going INTO GFPGAN had audio (e.g. because Stage
+        # 2.5 just muxed it on, or because LatentSync itself produced
+        # a file with audio), we have to re-mux that audio back onto
+        # the GFPGAN output before any later stage sees it -- else
+        # the final render is silent.
+        _pre_gfpgan_audio_donor = Path(raw)
         raw = gfpgan_enhance(raw, log=log)
         dt = time.perf_counter() - t0
         log(f"[timing] Stage 3 gfpgan took {dt:.2f}s")
         stage_times.append(("Stage 3 gfpgan", dt))
+
+        # Stage 3.5: re-mux audio onto the GFPGAN output if the donor
+        # had any.  Probe with ffprobe to avoid wasting time when the
+        # donor was silent in the first place.
+        try:
+            from .ffmpeg_tools import resolve_ffmpeg
+            import subprocess as _sp_g3
+            _ffprobe = (resolve_ffmpeg().replace("ffmpeg.exe", "ffprobe.exe")
+                         .replace("ffmpeg", "ffprobe"))
+            _probe = _sp_g3.run(
+                [_ffprobe, "-v", "error", "-select_streams", "a:0",
+                 "-show_entries", "stream=codec_type",
+                 "-of", "csv=p=0", str(_pre_gfpgan_audio_donor)],
+                capture_output=True, text=True, timeout=15,
+                encoding="utf-8", errors="ignore")
+            _donor_has_audio = "audio" in (_probe.stdout or "").lower()
+        except Exception:
+            # If probe fails, assume donor had audio -- a wasted mux
+            # is cheap compared to a silent final render.
+            _donor_has_audio = True
+        if _donor_has_audio:
+            t0_g35 = time.perf_counter()
+            try:
+                from .paths import RECORDINGS_DIR as _RD_G35
+                import time as _t_g35
+                _g35_out = _RD_G35 / (
+                    f"_gfpgan_audiomux_{int(_t_g35.time()*1000)}.mp4")
+                _RD_G35.mkdir(parents=True, exist_ok=True)
+                replace_audio_track(Path(raw),
+                                     Path(_pre_gfpgan_audio_donor),
+                                     _g35_out)
+                raw = _g35_out
+                dt_g35 = time.perf_counter() - t0_g35
+                log(f"[orchestrator] Stage 3.5: re-muxed audio from "
+                    f"{_pre_gfpgan_audio_donor.name} onto GFPGAN "
+                    f"output -> {_g35_out.name}")
+                log(f"[timing] Stage 3.5 gfpgan_audio_remux took "
+                    f"{dt_g35:.2f}s")
+                stage_times.append(("Stage 3.5 gfpgan_audio_remux",
+                                     dt_g35))
+            except Exception as _g35_exc:
+                log(f"[orchestrator] WARN Stage 3.5 audio re-mux "
+                    f"FAILED ({_g35_exc}); final output may be silent")
+        else:
+            log("[orchestrator] Stage 3.5: pre-GFPGAN file had no "
+                "audio, skipping audio re-mux")
 
     _check_cancel(cancel_event, log)
     # Stage 4 (optional): aspect-ratio reshape (crop/pad to target)
@@ -341,6 +442,39 @@ def _render_locked(job: LipsyncJob,
         dt = time.perf_counter() - t0
         log(f"[timing] Stage 5 watermark took {dt:.2f}s")
         stage_times.append(("Stage 5 watermark", dt))
+
+    # Finalize: ensure the final output mp4 lives inside RECORDINGS_DIR.
+    # Earlier stages (GFPGAN in particular) write into the lipsync_test
+    # scratch tree under v2/lipsync_test/output/, and Stage 4/5 use
+    # Path.with_name which keeps the output next to its input -- so the
+    # final file ends up in the scratch tree rather than recordings.
+    # The user explicitly wants their watermarked / final renders in
+    # recordings/lipsync/ so they can browse them. Move the file there
+    # if it isn't already.
+    from .paths import RECORDINGS_DIR as _FINAL_RECORDINGS
+    raw = Path(raw)
+    try:
+        _is_in_recordings = (
+            _FINAL_RECORDINGS.resolve() in raw.resolve().parents)
+    except Exception:
+        _is_in_recordings = False
+    if not _is_in_recordings:
+        try:
+            _FINAL_RECORDINGS.mkdir(parents=True, exist_ok=True)
+            _dest = _FINAL_RECORDINGS / raw.name
+            # If a file by that name already exists, timestamp the
+            # incoming one so we don't overwrite an earlier render.
+            if _dest.exists():
+                _stamp = int(time.time() * 1000)
+                _dest = _FINAL_RECORDINGS / f"{raw.stem}_{_stamp}{raw.suffix}"
+            import shutil as _shutil_final
+            _shutil_final.move(str(raw), str(_dest))
+            log(f"[orchestrator] moved final output to recordings: "
+                f"{_dest.name}")
+            raw = _dest
+        except Exception as _mv_exc:
+            log(f"[orchestrator] WARN could not move final output to "
+                f"recordings ({_mv_exc}); leaving at {raw}")
 
     total = time.perf_counter() - render_t0
     log("="*60)
@@ -492,5 +626,3 @@ def _render_multi(job: LipsyncJob,
             f"multi-clip concat produced near-empty output: "
             f"{final} ({final.stat().st_size} bytes)")
     return final
-
-

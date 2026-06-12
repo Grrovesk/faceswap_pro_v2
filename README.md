@@ -89,6 +89,19 @@ are cached.
 
 Browser opens at `http://localhost:7860`.
 
+### 5. (Optional but recommended) Verify your install
+
+```bash
+python detect_system.py
+```
+
+Audits your GPU, CUDA, every pinned package, and optional weights;
+writes `PROJECT_ENV.md` next to itself with a BLOCKER / WARN / PASS
+report and a `fix_hint` for anything that needs attention. See
+[INSTALL.md § Verify your install](INSTALL.md#verify-your-install-detect_systempy)
+for the full description. If you open an issue, attach
+`PROJECT_ENV.md` and you'll skip 80% of the back-and-forth.
+
 ---
 
 ## Features

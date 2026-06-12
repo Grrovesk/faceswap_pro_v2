@@ -126,6 +126,48 @@ def apply_watermark(video_in: Path, cfg: WatermarkConfig,
     return out_path
 
 
+# ----- TIMECODE OVERLAY (QA helper) -------------------------------
+def add_timecode_overlay(video_in: Path, log=print) -> Path:
+    """Re-encode ``video_in`` with a frame-number + HH:MM:SS overlay
+    in the top-left corner.  Returns the path to a new mp4 written
+    next to ``video_in`` named ``<stem>_timecode.mp4``.
+
+    Used by the "Generate timecoded preview" buttons in the Lip-Sync,
+    Face-Swap, and Render History tabs so the user can quickly spot
+    which specific frame is glitching without having to do mental
+    frame-rate arithmetic.  The original delivery file is left
+    untouched; the overlay version is purely for QA.
+    """
+    src = Path(video_in)
+    if not src.is_file():
+        raise FileNotFoundError(src)
+    out_path = src.with_name(src.stem + "_timecode.mp4")
+    ff = resolve_ffmpeg()
+    # %{frame_num} = zero-based decoded-frame index
+    # %{pts\:hms}  = HH:MM:SS.mmm (colon must be escaped inside
+    #                drawtext's : -separated option list)
+    vf = (
+        r"drawtext=text='%{frame_num} | %{pts\:hms}':"
+        r"x=10:y=10:fontsize=24:fontcolor=white:"
+        r"box=1:boxcolor=black@0.5:boxborderw=4"
+    )
+    log(f"[timecode] generating overlay -> {out_path.name}")
+    r = subprocess.run([
+        ff, "-y", "-loglevel", "error",
+        "-i", str(src),
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "copy",
+        str(out_path),
+    ], capture_output=True, text=True, encoding="utf-8",
+       errors="ignore")
+    if r.returncode != 0 or not out_path.exists():
+        raise RuntimeError(
+            f"timecode overlay failed: {(r.stderr or '')[-400:]}")
+    return out_path
+
+
 # ----- ASPECT RATIO -----------------------------------------------
 _ASPECT_MAP = {
     "16:9":          (1920, 1080),     # YouTube horizontal

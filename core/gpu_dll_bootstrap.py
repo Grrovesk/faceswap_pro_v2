@@ -125,6 +125,78 @@ def add_gpu_dll_dirs() -> List[str]:
     return list(_added_dirs)
 
 
+def preload_cuda_cudnn_dlls() -> List[str]:
+    """Pre-load PyTorch's bundled CUDA runtime + cuDNN DLLs via
+    ``ctypes.WinDLL`` with ABSOLUTE paths.
+
+    The PATH / add_dll_directory approach above tells Windows where to
+    SEARCH for DLLs.  But on some configs (different CUDA toolkit version
+    on system vs the one PyTorch was built against), the search still
+    fails on transitive dependencies of cudnn_cnn64_9.dll like
+    cudart64_12.dll or one of the cudnn_engines_* helpers.
+
+    The fix: load each DLL eagerly with an absolute path, in dependency
+    order.  After the load succeeds, the DLL is in the process loaded-
+    module table and any subsequent ``LoadLibrary`` from GFPGAN /
+    PyTorch / etc. returns the already-loaded handle without searching.
+
+    Idempotent: re-calling is harmless.  Failures are tolerated -- if a
+    file doesn't exist we just skip it.  Returns the list of DLLs that
+    actually loaded.
+    """
+    if sys.platform != "win32" or not _TORCH_LIB_DIR:
+        return []
+
+    import ctypes
+
+    # Order matters.  PyTorch bundles all of these in torch/lib.
+    # cuDNN's cudnn_cnn64_9.dll depends on the others -- load them
+    # FIRST so when cuDNN's loader probes for its dependencies they
+    # are already resolved.
+    dll_order = (
+        # CUDA runtime + math libs (cuDNN depends on these).
+        "cudart64_12.dll",
+        "cublas64_12.dll",
+        "cublasLt64_12.dll",
+        "cufft64_11.dll",
+        "curand64_10.dll",
+        "cusolver64_11.dll",
+        "cusparse64_12.dll",
+        "nvrtc64_120_0.dll",
+        "nvrtc-builtins64_124.dll",
+        # cuDNN graph layer (loaded by all cuDNN sub-libs).
+        "cudnn64_9.dll",
+        "cudnn_graph64_9.dll",
+        # cuDNN engine + heuristics (cnn depends on these).
+        "cudnn_engines_precompiled64_9.dll",
+        "cudnn_engines_runtime_compiled64_9.dll",
+        "cudnn_heuristic64_9.dll",
+        # cuDNN convolution + ops (these are what GFPGAN ultimately needs).
+        "cudnn_cnn64_9.dll",
+        "cudnn_ops64_9.dll",
+        "cudnn_adv64_9.dll",
+    )
+    loaded: List[str] = []
+    skipped: List[str] = []
+    for name in dll_order:
+        full = os.path.join(_TORCH_LIB_DIR, name)
+        if not os.path.isfile(full):
+            skipped.append(name)
+            continue
+        try:
+            ctypes.WinDLL(full)
+            loaded.append(name)
+        except OSError as exc:
+            logger.warning("preload failed for %s: %s", name, exc)
+    if loaded:
+        logger.info("Preloaded %d CUDA/cuDNN DLLs from %s: %s",
+                    len(loaded), _TORCH_LIB_DIR, loaded)
+    if skipped:
+        logger.debug("Skipped (not present in torch/lib): %s", skipped)
+    return loaded
+
+
 # Auto-apply at import. Callers that prefer explicit control can still
-# call add_gpu_dll_dirs() themselves.
+# call add_gpu_dll_dirs() and preload_cuda_cudnn_dlls() themselves.
 add_gpu_dll_dirs()
+preload_cuda_cudnn_dlls()

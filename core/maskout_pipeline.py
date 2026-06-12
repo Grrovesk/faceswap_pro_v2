@@ -352,7 +352,8 @@ def run_pipeline(source_video: Path,
                   workspace: Path,
                   dilate_px: int = 12,
                   feather: int = 8,
-                  log: Callable[[str], None] = print) -> dict:
+                  log: Callable[[str], None] = print,
+                  mask_npy_path: str = "") -> dict:
     """Run SAM2 -> void source, return paths the orchestrator needs.
 
     Returns dict with keys:
@@ -360,12 +361,28 @@ def run_pipeline(source_video: Path,
       - void_video: Path -- inpainted source for LatentSync to render on
     The caller then runs LatentSync on void_video, then calls
     composite_back(source_video, lipsync_video, masks_npy, ...).
+
+    Phase 1.5: ``mask_npy_path`` -- when non-empty AND the file exists,
+    skip the SAM2 worker invocation and use this pre-computed mask
+    directly.  Lets the Rotoscoping tab hand off interactively-built
+    masks without paying SAM2 inference twice.  ``clicks`` is ignored
+    in this case (so callers can pass [] when overriding).
     """
     workspace = Path(workspace)
     workspace.mkdir(parents=True, exist_ok=True)
     masks_npy = workspace / "sam2_masks.npy"
     void_video = workspace / "void_source.mp4"
-    run_sam2_masks(source_video, clicks, masks_npy, log=log)
+
+    override = (mask_npy_path or "").strip()
+    if override and Path(override).is_file():
+        log(f"[maskout] using pre-computed masks: {override}")
+        masks_npy = Path(override)
+    else:
+        if override:
+            log(f"[maskout] mask_npy_path was set but file missing "
+                f"({override}); falling back to SAM2 from clicks")
+        run_sam2_masks(source_video, clicks, masks_npy, log=log)
+
     make_void_source(source_video, masks_npy, void_video,
                       dilate_px=dilate_px, log=log)
     return {"masks_npy": masks_npy, "void_video": void_video}

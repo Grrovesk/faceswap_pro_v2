@@ -11,6 +11,7 @@
 - [Step 5 — first launch (auto-downloads)](#step-5--first-launch)
 - [Optional: voice swap (RVC)](#optional-voice-swap-rvc)
 - [Optional: virtual camera](#optional-virtual-camera)
+- [Verify your install (`detect_system.py`)](#verify-your-install-detect_systempy)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -204,7 +205,45 @@ The webcam tab will show a "Send to virtual camera" toggle.
 
 ---
 
+## Verify your install (`detect_system.py`)
+
+Before your first render, run the bundled environment audit:
+
+```bash
+python detect_system.py
+```
+
+It detects your hardware (CPU, RAM, GPU, VRAM, CUDA, cuDNN), checks
+Python + PyTorch + ffmpeg, verifies every pinned package in
+`requirements.txt` is installed at the right version, and looks for
+the optional weights the app uses (SAM2, inswapper_128.onnx,
+GFPGAN). Each finding is tagged:
+
+- **BLOCKER** — the app will not run until you fix it
+- **WARN** — the app runs, but a feature will OOM / be unavailable
+- **INFO** — informational (cuDNN version, FP8-capable compute, etc.)
+- **PASS** — working as expected
+
+Every blocker and warning ships with a `fix_hint` — the exact
+command to run to fix it.
+
+Two artifacts are written next to the script:
+
+- `PROJECT_ENV.md` — human-readable hardware + compatibility report
+- `PROJECT_ENV.json` — same data, machine-readable
+
+Exit code is `0` if no blockers, `1` if any. Safe to call from CI
+or wrapper scripts.
+
+---
+
 ## Troubleshooting
+
+> **Before opening an issue:** run `python detect_system.py` and
+> attach the generated `PROJECT_ENV.md`. Most "it won't run"
+> reports resolve themselves from the BLOCKER / WARN entries — and
+> when they don't, the report tells us your exact environment so
+> we don't need a back-and-forth to triage.
 
 ### "ImportError: cannot import name X from diffusers"
 
@@ -263,6 +302,12 @@ webcam features. Place it at `checkpoints/inswapper_128.onnx`.
 ---
 
 ## Verifying the install
+
+The fastest verification is the [`detect_system.py`](#verify-your-install-detect_systempy)
+audit above — it covers Python, CUDA, every pinned package, and
+optional weights in one shot. The lower-level smoke tests below
+remain useful when you want to confirm the **Python import graph**
+itself is clean (i.e. your editor didn't half-save a file mid-edit).
 
 Smoke test (no model loads):
 

@@ -1,8 +1,8 @@
 """Live preview helpers + render ETA + sidecar JSON.
 
-NEW FEATURES delivered:
+Features:
   - Frame-0 thumbnail extraction for face clips
-  - Audio waveform image (matplotlib-free, pure numpy + PIL fallback)
+  - Audio waveform image (pure ffmpeg via showwavespic)
   - Render-time ETA estimate based on empirical s/frame
   - Sidecar JSON write/read so any past render can be exactly reproduced
 """
@@ -126,7 +126,7 @@ def estimate_render_seconds(face_paths: List[Path],
             try:
                 a_dur = probe_duration_seconds(audio_path)
                 if a_dur > total_dur_s:
-                    total_dur_s = a_dur   # last clip extends to fill
+                    total_dur_s = a_dur
             except Exception:
                 pass
     elif extend_single and audio_path:
@@ -141,7 +141,7 @@ def estimate_render_seconds(face_paths: List[Path],
     frames = int(total_dur_s * fps)
     seconds = int(frames * s_per_frame)
     if enhance_faces:
-        seconds = int(seconds * 1.15)   # GFPGAN overhead ~15%
+        seconds = int(seconds * 1.15)
     mins, secs = divmod(seconds, 60)
     label = (f"~{frames} frames · ETA ~{mins}m {secs}s "
              f"(at {s_per_frame:.2f} s/frame; "
@@ -154,13 +154,25 @@ def sidecar_path_for(mp4_path: Path) -> Path:
     return Path(mp4_path).with_suffix(".job.json")
 
 
+def _maybe_asdict(obj):
+    """asdict() if it's a dataclass, else None.  Used so sidecar
+    capture survives older LipsyncJob shapes that may not have
+    every optional sub-config attached."""
+    try:
+        return asdict(obj)
+    except Exception:
+        return None
+
+
 def write_sidecar(job: LipsyncJob, mp4_path: Path,
                    elapsed_s: float, frames: int) -> Path:
-    """Write a JSON describing the job that produced mp4_path.  Any
-    past render can then be exactly reproduced via load_sidecar()."""
+    """Write a JSON describing the lipsync job that produced
+    mp4_path.  Any past render can then be exactly reproduced via
+    load_sidecar() + History tab "Restore settings"."""
     sp = sidecar_path_for(mp4_path)
     blob = {
         "version": "v2",
+        "kind": "lipsync",
         "face_paths": [str(p) for p in job.face_paths],
         "audio_path": str(job.audio_path),
         "isolate_vocals": job.isolate_vocals,
@@ -169,9 +181,71 @@ def write_sidecar(job: LipsyncJob, mp4_path: Path,
         "extend_single": job.extend_single,
         "latentsync": asdict(job.latentsync),
         "voice_swap": asdict(job.voice_swap),
+        "watermark": _maybe_asdict(getattr(job, "watermark", None)),
+        "aspect": _maybe_asdict(getattr(job, "aspect_ratio", None)),
+        "maskout": _maybe_asdict(getattr(job, "mask_out", None)),
+        "occlusion": _maybe_asdict(getattr(job, "occlusion", None)),
         "elapsed_s": float(elapsed_s),
         "frames": int(frames),
         "s_per_frame": (float(elapsed_s) / max(int(frames), 1)),
+    }
+    sp.write_text(json.dumps(blob, indent=2), encoding="utf-8")
+    return sp
+
+
+def write_video_swap_sidecar(job, mp4_path: Path,
+                                elapsed_s: float) -> Path:
+    """Sidecar for Face Swap renders (kind='face_swap').  Mirrors the
+    lipsync write_sidecar so the History tab "Restore settings"
+    button can populate either tab from one button.
+    """
+    sp = sidecar_path_for(mp4_path)
+    blob = {
+        "version": "v2",
+        "kind": "face_swap",
+        "source_image": str(getattr(job, "source_image", "")),
+        "target_video": str(getattr(job, "target_video", "")),
+        "blend_method": getattr(job, "blend_method", "poisson"),
+        "enhance_faces": bool(getattr(job, "enhance_faces", False)),
+        "det_threshold": float(getattr(job, "det_threshold", 0.5)),
+        "output_quality": getattr(job, "output_quality",
+                                    "visually_lossless"),
+        "trim_start_frame": int(getattr(job, "trim_start_frame", 0)),
+        "trim_end_frame": int(getattr(job, "trim_end_frame", 0)),
+        "selector_mode": getattr(job, "selector_mode", "largest"),
+        "reference_face_image": str(
+            getattr(job, "reference_face_image", "") or ""),
+        "reference_distance": float(
+            getattr(job, "reference_distance", 0.6)),
+        "mask_padding": int(getattr(job, "mask_padding", 0)),
+        "mask_blur": float(getattr(job, "mask_blur", 1.0)),
+        "swap_strength": float(getattr(job, "swap_strength", 1.0)),
+        "enhancer_blend": float(getattr(job, "enhancer_blend", 1.0)),
+        "pixel_boost": int(getattr(job, "pixel_boost", 128)),
+        "temporal_enabled": bool(
+            getattr(job, "temporal_enabled", True)),
+        "temporal_ema_decay": float(
+            getattr(job, "temporal_ema_decay", 0.85)),
+        "temporal_buffer_size": int(
+            getattr(job, "temporal_buffer_size", 5)),
+        "color_transfer_mode": getattr(job, "color_transfer_mode",
+                                          "reinhard"),
+        "shadow_correction": bool(
+            getattr(job, "shadow_correction", True)),
+        "shadow_clamp_min": float(
+            getattr(job, "shadow_clamp_min", 0.5)),
+        "shadow_clamp_max": float(
+            getattr(job, "shadow_clamp_max", 1.5)),
+        "source_image_b": str(
+            getattr(job, "source_image_b", "") or ""),
+        "blend_alpha": float(getattr(job, "blend_alpha", 0.5)),
+        "journey_mode": bool(getattr(job, "journey_mode", False)),
+        "journey_start_alpha": float(
+            getattr(job, "journey_start_alpha", 0.0)),
+        "journey_end_alpha": float(
+            getattr(job, "journey_end_alpha", 1.0)),
+        "journey_curve": getattr(job, "journey_curve", "linear"),
+        "elapsed_s": float(elapsed_s),
     }
     sp.write_text(json.dumps(blob, indent=2), encoding="utf-8")
     return sp
