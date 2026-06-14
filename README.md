@@ -50,9 +50,9 @@ Five tabs, one window, one GPU:
 
 ### Workflow plumbing across all tabs
 
-- **Send to →** buttons hand outputs between tabs without
-  re-uploading: Rotoscope mask → Lip-Sync / Face-Swap; Lip-Sync
-  output → Face-Swap source video; Face-Swap output → Lip-Sync
+- **Send to ->** buttons hand outputs between tabs without
+  re-uploading: Rotoscope mask -> Lip-Sync / Face-Swap; Lip-Sync
+  output -> Face-Swap source video; Face-Swap output -> Lip-Sync
   source video.
 - **Projects** — save the entire Lip-Sync + Face-Swap knob state to
   a named project file, reload at any time, share `.fpproj` files
@@ -146,13 +146,13 @@ for the full description. If you open an issue, attach
 
 ### Lip-Sync (LatentSync 1.6)
 
-- 512×512 native resolution (1.6 retrained at 512 to fix the blurry
+- 512x512 native resolution (1.6 retrained at 512 to fix the blurry
   teeth/lips problem of 1.5).
-- DeepCache 2× speedup, deterministic seeds for reproducibility.
+- DeepCache 2x speedup, deterministic seeds for reproducibility.
 - 20-step DDIM default; tunable.
 - **Vocal isolation (Demucs)** so the model conditions on clean
   vocals even when the input track is a song with instruments.
-- **Per-clip identity fine-tune** (~10–30 min on a 4090) overfits
+- **Per-clip identity fine-tune** (~10-30 min on a 4090) overfits
   motion and attention layers to one source video for much better
   likeness retention.
 - **SAM 2 mask-out** — click a non-face object (cat, animal, prop,
@@ -187,7 +187,7 @@ for the full description. If you open an issue, attach
   multi-person videos.
 - **Identity blend** — two source images, alpha slider, hybrid
   identity in ArcFace space.
-- **Embedding journey** — alpha ramps A→B across the timeline for
+- **Embedding journey** — alpha ramps A->B across the timeline for
   a continuous identity morph (linear or smoothstep curve).
 - **Temporal smoothing** — EMA on detected face boxes across frames
   reduces jitter on shaky sources.
@@ -230,4 +230,92 @@ for the full description. If you open an issue, attach
 - Recording to MP4 + "Open recordings folder" shortcut.
 - Platform-aware camera backend selection (CAP_DSHOW on Windows).
 
-###
+### Job queue & history
+
+- Submit lip-sync jobs from the Lip-Sync tab's "Queue" button.
+- Queue worker drains them serially; foreground "Run" button and
+  queue worker share a single render lock so two renders never
+  share one GPU.
+- Cancel honored both during and before render (wakes a queued
+  job to abort before model loads).
+- **Restore settings** — any past render can re-populate the
+  originating tab from its sidecar with one click.
+- **Projects** — save/load entire session knob state across
+  Lip-Sync + Face-Swap tabs as a named `.fpproj` file.
+
+---
+
+## Documentation
+
+- **[INSTALL.md](INSTALL.md)** — detailed install + model download
+  + Windows quirks
+- **[USAGE.md](USAGE.md)** — per-tab user manual with screenshots
+- **[USAGE_POLICY.md](USAGE_POLICY.md)** — what you may and may not
+  use this software for
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — contributor workflow,
+  code style, testing
+- **[CHANGELOG.md](CHANGELOG.md)** — release notes
+- **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)** — upstream
+  licenses and citations
+- **[CITATION.cff](CITATION.cff)** — cite this project in academic
+  work
+
+---
+
+## Architecture overview
+
+Key modules:
+
+- `faceswap/orchestrator.py` — stages a render through voice swap ->
+  vocal isolation -> optional mask-out -> lip-sync -> optional
+  composite-back -> Reinhard color match -> optional restoration ->
+  aspect -> watermark -> mux. Single global render lock.
+- `core/pipeline.py` — face-swap pipeline (detect, identity, swap,
+  audio-sync, lighting, blend, temporal, enhance per frame). Per-
+  frame rotoscope-mask filter `_filter_faces_by_mask` drops
+  detected faces outside the masked region.
+- `core/swap_backends/` — pluggable swap backend registry. `base.py`
+  abstract; `inswapper.py` is the shipped engine.
+- `core/lipsync.py` — LatentSync subprocess invocation, dep probe,
+  HuggingFace download, checkpoint resolution.
+- `core/lipsync_color_match.py` — Stage 2.4 Reinhard LAB transfer
+  with Haar-cascade face crop and feathered mask blending.
+- `core/face_restoration/` — pluggable face-restorer backends
+  (GFPGAN / CodeFormer / RestoreFormer++) with auto-download.
+- `core/maskout_pipeline.py` — SAM 2 multi-click -> TELEA inpaint ->
+  void source -> caller runs lip-sync -> composite-back.
+- `core/sam2_daemon.py` — long-lived SAM 2 process for the
+  Rotoscope tab; warmup on `load_video`, incremental
+  `add_new_points_or_box` calls per click.
+- `core/rotoscope_cache.py` — per-source frame extraction cache and
+  `.npy` mask stack writer.
+- `core/browser_safe_preview.py` — ffprobe-gated H.264/AAC/faststart
+  transcode for rotoscope source preview.
+- `core/lipsync_finetune.py` — per-clip identity fine-tune via
+  `LatentSync/scripts/train_oneshot.py` subprocess.
+- `faceswap/projects.py` — `.fpproj` save/load for session bundles.
+- `faceswap/previews.py` — sidecar writers
+  (`write_sidecar` for lipsync, `write_video_swap_sidecar` for face
+  swap), thumbnail + waveform extractors.
+- `faceswap/rotoscope/ui.py` — Rotoscope tab Gradio surface.
+- `tools/check_tail_integrity.py`, `tools/check_public_symbols.py` —
+  launch-time integrity prechecks.
+
+---
+
+## Citing this project
+
+If you use faceswap_pro in academic work, please cite the project
+metadata in [CITATION.cff](CITATION.cff). If you use any of the
+upstream models (LatentSync, inswapper_128, GFPGAN, CodeFormer,
+RestoreFormer, SAM 2, Whisper, Demucs, RVC), please cite their
+original papers — see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+---
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
+
+Additional usage restrictions apply — see
+[USAGE_POLICY.md](USAGE_POLICY.md).
