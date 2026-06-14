@@ -7,6 +7,8 @@ RestoreFormer++ (face restoration), Demucs (vocal isolation),
 SAM 2 (multi-object segmentation + mask propagation), and RVC
 (voice cloning).
 
+![Lip-Sync tab](assets/lipsynch_tab.png)
+
 > **Synthetic media notice.** This software produces realistic
 > face-swapped and lip-synced video. Before you use it, read
 > [USAGE_POLICY.md](USAGE_POLICY.md). Non-consensual sexual imagery,
@@ -171,6 +173,8 @@ for the full description. If you open an issue, attach
 
 ### Face-Swap (inswapper_128)
 
+![Face-Swap tab](assets/faceswap_tab.png)
+
 - 128-native inswapper with stable face alignment.
 - **Pixel boost** (256/384/512/768) — post-swap upscale on the
   aligned face crop with scaled warp matrix; cleans up close-ups.
@@ -204,6 +208,8 @@ for the full description. If you open an issue, attach
 
 ### Rotoscope
 
+![Rotoscope tab](assets/rotoscope_tab.png)
+
 - **SAM 2 backend** running as a long-lived daemon (loaded once,
   many clicks).
 - **Multi-object** — click subject 1, paint clicks. Click subject 2,
@@ -223,6 +229,8 @@ for the full description. If you open an issue, attach
   never throws "Video not supported" on weird codecs.
 
 ### Webcam
+
+![Webcam tab](assets/webcam_tab.png)
 
 - Real-time face-swap on webcam input.
 - Optional Windows virtual camera output (OBS / pyvirtualcam).

@@ -242,6 +242,15 @@ class FaceSwapPipeline:
             )
             self.frame_buffer = FrameBuffer(size=temp_cfg.get("buffer_size", 5))
 
+        # T2-NEW safety: initialize the rotoscope mask stack here so the
+        # per-frame _stage_detect attribute access is always safe, even
+        # when the caller bypasses run() (e.g. webcam swap_fn which drives
+        # _stage_detect / _stage_swap / _stage_blend directly per frame).
+        # run() will later re-assign this from cfg["mask_gate"]["npy_path"]
+        # if a mask was provided by the face-swap tab.
+        if not hasattr(self, "_mask_stack"):
+            self._mask_stack = None
+
         self._initialised = True
         logger.info("All pipeline modules initialised.")
 
