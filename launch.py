@@ -5,11 +5,14 @@ v2's own webcam stream routes (/webcam_stream/*), mounts Gradio at
 '/'. The webcam subsystem lives entirely in v2/faceswap/webcam/.
 ZERO imports from ui.app or ui.stream_server -- v2 is its own world.
 """
+import os
 import sys
 import time
 import tempfile
 import logging
 from pathlib import Path
+
+os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # v2 is STANDALONE: core/ and utils/ live INSIDE v2/. We do NOT add

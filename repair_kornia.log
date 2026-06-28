@@ -1,0 +1,27 @@
+Found existing installation: kornia 0.8.2
+Uninstalling kornia-0.8.2:
+  Successfully uninstalled kornia-0.8.2
+Collecting kornia
+  Downloading kornia-0.8.2-py2.py3-none-any.whl (1.1 MB)
+     ---------------------------------------- 1.1/1.1 MB 1.4 MB/s eta 0:00:00
+Requirement already satisfied: torch>=2.0.0 in f:\faceswap_pro_v2\venv\lib\site-packages (from kornia) (2.12.1)
+Requirement already satisfied: kornia_rs>=0.1.9 in f:\faceswap_pro_v2\venv\lib\site-packages (from kornia) (0.1.14)
+Requirement already satisfied: packaging in f:\faceswap_pro_v2\venv\lib\site-packages (from kornia) (26.2)
+Requirement already satisfied: sympy>=1.13.3 in f:\faceswap_pro_v2\venv\lib\site-packages (from torch>=2.0.0->kornia) (1.14.0)
+Requirement already satisfied: networkx>=2.5.1 in f:\faceswap_pro_v2\venv\lib\site-packages (from torch>=2.0.0->kornia) (3.4.2)
+Requirement already satisfied: fsspec>=0.8.5 in f:\faceswap_pro_v2\venv\lib\site-packages (from torch>=2.0.0->kornia) (2026.6.0)
+Requirement already satisfied: filelock in f:\faceswap_pro_v2\venv\lib\site-packages (from torch>=2.0.0->kornia) (3.29.4)
+Requirement already satisfied: typing-extensions>=4.10.0 in f:\faceswap_pro_v2\venv\lib\site-packages (from torch>=2.0.0->kornia) (4.15.0)
+Requirement already satisfied: jinja2 in f:\faceswap_pro_v2\venv\lib\site-packages (from torch>=2.0.0->kornia) (3.1.6)
+Requirement already satisfied: setuptools<82 in f:\faceswap_pro_v2\venv\lib\site-packages (from torch>=2.0.0->kornia) (81.0.0)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in f:\faceswap_pro_v2\venv\lib\site-packages (from sympy>=1.13.3->torch>=2.0.0->kornia) (1.3.0)
+Requirement already satisfied: MarkupSafe>=2.0 in f:\faceswap_pro_v2\venv\lib\site-packages (from jinja2->torch>=2.0.0->kornia) (3.0.3)
+Installing collected packages: kornia
+Successfully installed kornia-0.8.2
+
+[notice] A new release of pip is available: 23.0.1 -> 26.1.2
+[notice] To update, run: F:\faceswap_pro_v2\venv\Scripts\python.exe -m pip install --upgrade pip
+F:\faceswap_pro_v2\venv\lib\site-packages\kornia\enhance\jpeg.py
+True
+27124
+has_nul False

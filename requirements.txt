@@ -22,7 +22,7 @@ fastapi>=0.110
 uvicorn[standard]>=0.27
 
 # ---- model runtime ----
-onnxruntime-gpu>=1.18
+onnxruntime-gpu==1.16.3
 diffusers>=0.32.2
 transformers>=4.40
 accelerate>=0.30
